@@ -5,7 +5,8 @@
 //! 与契约 / 管理 HTTP API，无私有后门），**观测也全部走契约**：归一化视图、workspace 映射、
 //! 事件历史。
 //!
-//! 找不到宿主或 fake-pi 就跳过（`eprintln!`，不 fail）；跑起来之后用「防空洞」断言检查条数，
+//! 找不到宿主或 fake-pi 就 **panic**（不是跳过）：这条演练是票 #4 的验收标准，零断言的绿不是绿
+//! （`common::require_host_and_fake_pi`）；跑起来之后用「防空洞」断言检查条数，
 //! 保证没有半途而废也能变绿。
 
 mod common;
@@ -20,7 +21,7 @@ use farm_sdk::services::tracker::IssueState;
 use farm_sdk::services::workspace::{WorktreeEstablishRequest, WorktreeState};
 use orchestrator::exec::{dispatch_ticket, Outcome, WorktreeLayout};
 
-use common::{fake_pi_bin, host_bin, Checks, TestHost, SEED_LABEL};
+use common::{require_host_and_fake_pi, Checks, TestHost, SEED_LABEL};
 
 /// 被派发的那张票（宿主播种的原生票号即票 id）。
 const TICKET: &str = "7";
@@ -73,12 +74,7 @@ fn git(cwd: &Path, args: &[&str]) {
 
 #[tokio::test]
 async fn one_ticket_goes_from_claim_to_a_successful_dispatch_against_a_real_host() {
-    let (Some(_), Some(fake_pi)) = (host_bin(), fake_pi_bin()) else {
-        eprintln!(
-            "farm-host 或 fake-pi 二进制没找到（给 FARM_HOST_BIN / FAKE_PI_BIN）；跳过派发序列 e2e"
-        );
-        return;
-    };
+    let (_host_bin, _fake_pi) = require_host_and_fake_pi();
 
     let scratch = tempfile::tempdir().expect("scratch dir");
     let repo = scratch.path().join("repo");
@@ -88,13 +84,22 @@ async fn one_ticket_goes_from_claim_to_a_successful_dispatch_against_a_real_host
     let host = TestHost::spawn(
         &[TICKET_NUMBER, SEED_TICKET_NUMBER],
         &[
-            ("FARM_AGENT_PROGRAM", fake_pi.to_string_lossy().into_owned()),
+            (
+                "FARM_AGENT_PROGRAM",
+                _fake_pi.to_string_lossy().into_owned(),
+            ),
             ("FAKE_PI_SCENARIO", "normal".to_string()),
         ],
     )
     .await;
     let client = host.client();
     let mut checks = Checks::default();
+    // 前置：两个替身二进制都真的到场（前置不齐就在这里失败，而不是伪装成绿）。
+    checks.record(
+        "the drill prerequisites are present (a real farm-host and the fake agent)",
+        true,
+        format!("{_host_bin:?} + {_fake_pi:?}"),
+    );
 
     // 夹具就绪：契约面可达（握手）。
     match client.handshake().await {

@@ -44,8 +44,8 @@ fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("response serializes")
 }
 
-/// 假宿主的一条读数：`(方法, 路径不含查询串) → 响应体`。
-type Routes = BTreeMap<String, String>;
+/// 假宿主的一条读数：`(方法, 路径不含查询串) → (HTTP 状态码, 响应体)`。
+type Routes = BTreeMap<String, (u16, String)>;
 
 struct StubHost {
     addr: SocketAddr,
@@ -88,8 +88,8 @@ impl StubHost {
                         .get(&format!("{method} {path}"))
                         .cloned();
                     let response = match body {
-                        Some(body) => format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                        Some((status, body)) => format!(
+                            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         ),
@@ -122,7 +122,18 @@ impl StubHost {
         self.routes
             .lock()
             .unwrap()
-            .insert(format!("{method} {path}"), json(body));
+            .insert(format!("{method} {path}"), (200, json(body)));
+    }
+
+    /// 一条**失败**读数：闭集错误码的 HTTP 状态码 + 契约错误信封。
+    fn set_error(&self, method: &str, path: &str, code: ErrorCode) {
+        self.routes.lock().unwrap().insert(
+            format!("{method} {path}"),
+            (
+                code.http_status(),
+                ContractError::new(code, "scripted failure").to_json(),
+            ),
+        );
     }
 
     fn request_log(&self) -> Vec<String> {
@@ -263,6 +274,20 @@ fn merge_event() -> EventEnvelope {
         actor: "merge".to_string(),
         ticket_id: Some(TICKET.to_string()),
         attempt_id: None,
+        payload: serde_json::Value::Null,
+        audited: false,
+    }
+}
+
+/// 一张票的某类事件（宿主事件时间戳形状的时间）。
+fn ticket_event(id: &str, kind: EventKind, occurred_at: &str, attempt_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        id: id.to_string(),
+        kind,
+        occurred_at: occurred_at.to_string(),
+        actor: "host".to_string(),
+        ticket_id: Some(TICKET.to_string()),
+        attempt_id: Some(attempt_id.to_string()),
         payload: serde_json::Value::Null,
         audited: false,
     }
@@ -644,6 +669,108 @@ async fn the_next_tick_dispatches_the_ticket_i_hold_and_then_releases_the_merged
 }
 
 #[tokio::test]
+async fn a_failed_dispatch_puts_the_ticket_in_cooldown_so_the_next_tick_does_not_redispatch_it() {
+    // 票 #4 的「dispatch 非 service_unavailable 失败 ⇒ release + 记冷却」。这次失败在事件面
+    // **没有任何事件**（宿主不会为一次没起来的 dispatch 发事件），所以冷却只能由 tick 自己
+    // 折进世界；否则这张票每个 tick 都会被重新抢 + 重新派发，永远不停。
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        issues(Some(ASSIGNEE), IssueState::Claimed),
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+    // 派发本身失败：`invalid_request`（只可能是我们自己编错了请求 ⇒ 放弃 + 交还 + 记冷却）。
+    host.set_error(
+        "POST",
+        &contract_path(ServiceName::AgentRunner, "/dispatches"),
+        ErrorCode::InvalidRequest,
+    );
+    let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
+    let ledger = Mutex::new(EventLedger::default());
+    let mut world = WorldModel::default();
+    let config = test_config(host.addr);
+
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+    assert!(
+        matches!(
+            report.outcomes.as_slice(),
+            [TickOutcome::Dispatch {
+                outcome: Outcome::Abandoned {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }]
+        ),
+        "派发失败的分支：{:?}",
+        report.outcomes
+    );
+    assert_eq!(
+        world.backoff_until.get(TICKET).map(String::as_str),
+        Some("2026-01-01T00:00:01Z"),
+        "冷却截止时刻 = 失败时刻 + effective retry_backoff.base_delay_ms（1000ms）"
+    );
+
+    // 下一个 tick（同一秒里，tick 间隔 50ms）：冷却未过 ⇒ 不重派、也不重抢。
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:00Z",
+        2,
+    )
+    .await;
+    assert!(
+        report.decisions.is_empty(),
+        "冷却中的票本 tick 不碰：{:?}",
+        report.decisions
+    );
+    assert_eq!(
+        dispatched_count(&host),
+        1,
+        "冷却期里没有第二次派发（这正是修之前每 tick 重派的那个洞）"
+    );
+
+    // 冷却过去之后（`now` 越过截止时刻）：重新派的——崩溃重启的续跑走的正是这条路。
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:02Z",
+        3,
+    )
+    .await;
+    assert!(
+        matches!(report.decisions.as_slice(), [Decision::Dispatch { .. }]),
+        "冷却到期后重新派：{:?}",
+        report.decisions
+    );
+    assert_eq!(dispatched_count(&host), 2);
+}
+
+/// 假宿主上收到过几次 dispatch 契约调用。
+fn dispatched_count(host: &StubHost) -> usize {
+    host.counts()
+        .get(&format!(
+            "POST {}",
+            contract_path(ServiceName::AgentRunner, "/dispatches")
+        ))
+        .copied()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
 async fn a_tick_that_cannot_pin_the_repo_id_stays_idle_and_does_not_invent_a_config() {
     // 两条映射并存、且都与我无关：没有任何契约字段能指出「本编排器的那条」。
     let host = StubHost::spawn(BTreeMap::new()).await;
@@ -690,6 +817,96 @@ async fn a_tick_that_cannot_pin_the_repo_id_stays_idle_and_does_not_invent_a_con
 // ---------------------------------------------------------------------------
 // (c) WS 入账
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_truncated_pull_does_not_latch_the_fallback_for_the_rest_of_the_process() {
+    // 「最近一页被截断」是宿主忙时的常态。截断位若 OR 起来永不清理，recon 的退化路径
+    // （完成信号回退 issues 快照）就成了稳态，history_truncated 的 WARN 每 tick 都响。
+    // 截断是**这一次读数**的性质 ⇒ 账上取当前那一页的读数。
+    let mut ledger = EventLedger::default();
+    ledger.absorb(&EventHistoryResponse {
+        events: vec![ticket_event(
+            "e-1",
+            EventKind::Dispatch,
+            "2026-01-01T00:00:05Z",
+            "attempt-1",
+        )],
+        truncated: true,
+    });
+    assert!(ledger.page().truncated, "截断的那一页如实记着截断");
+
+    ledger.absorb(&EventHistoryResponse {
+        events: Vec::new(),
+        truncated: false,
+    });
+    assert!(
+        !ledger.page().truncated,
+        "下一页不截断 ⇒ 账上不再说截断（截断位不粘）"
+    );
+
+    // 退化路径的判据就是账上的这个位：不截断 − 不得从 issues 快照里把 done 当完成信号。
+    let world = recon::rebuild(
+        ASSIGNEE,
+        &issues(Some(ASSIGNEE), IssueState::Done),
+        &ledger.page(),
+        &mappings(Vec::new()),
+        None,
+        &RetryBackoff::default(),
+    );
+    assert!(
+        world.merge_done.is_empty(),
+        "不截断就不走 issues 快照的完成信号兜底，得到 {:?}",
+        world.merge_done
+    );
+}
+
+#[tokio::test]
+async fn a_newer_page_followed_by_an_older_one_still_shows_the_attempt_as_active() {
+    // 事件账的两路来源（WS 快照 = 整个保留窗口；HTTP 增量页 = 最近一页）以**到达顺序**混进
+    // 同一本账：宿主忙时/重启后，账上的到达顺序会是「较新的一页 ++ 较旧的一页」。按到达顺序
+    // 折叠，一条比活跃 dispatch **更早**的终态事件会覆盖掉 active_attempts，于是 decide 会
+    // 重新派发一张正在跑的票（`a_sigkill_then_a_restart_does_not_dispatch_twice` 守的正是这条
+    // 不变量）。所以折叠用的是 `occurred_at`（契约唯一能给的顺序），不是到达顺序。
+    let mut ledger = EventLedger::default();
+    ledger.absorb(&EventHistoryResponse {
+        events: vec![ticket_event(
+            "e-newer",
+            EventKind::Dispatch,
+            "2026-01-01T00:00:10Z",
+            "attempt-1",
+        )],
+        truncated: false,
+    });
+    ledger.absorb(&EventHistoryResponse {
+        events: vec![ticket_event(
+            "e-older",
+            EventKind::Interrupted,
+            "2026-01-01T00:00:09Z",
+            "attempt-0",
+        )],
+        truncated: false,
+    });
+
+    let world = recon::rebuild(
+        ASSIGNEE,
+        &issues(Some(ASSIGNEE), IssueState::Claimed),
+        &ledger.page(),
+        &mappings(Vec::new()),
+        None,
+        &RetryBackoff::default(),
+    );
+
+    assert_eq!(
+        world.active_attempts,
+        BTreeMap::from([(TICKET.to_string(), Some("attempt-1".to_string()))]),
+        "比 dispatch 更早的终态事件不得结束这个 attempt（否则会重派一张在跑的票）"
+    );
+    assert_eq!(
+        world.event_watermark.as_deref(),
+        Some("2026-01-01T00:00:10Z"),
+        "游标 = 账上最新事件的 occurred_at，而不是最后到达的那一条"
+    );
+}
 
 #[test]
 fn the_event_ledger_is_append_only_dedupes_by_id_and_keeps_the_cursor_at_the_tail() {
@@ -886,6 +1103,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AlertLog {
 async fn tick_with_alerts(host: &StubHost, now: &str) -> (TickReport, Vec<String>) {
     let log = AlertLog::default();
     let subscriber = tracing_subscriber::registry().with(log.clone());
+    crate::test_support::install_global_noop_subscriber();
     let _guard = tracing::subscriber::set_default(subscriber);
     let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
     let ledger = Mutex::new(EventLedger::default());

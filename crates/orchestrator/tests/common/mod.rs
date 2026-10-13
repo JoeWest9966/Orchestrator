@@ -1,10 +1,11 @@
 //! 集成测试夹具：拉起**真实 farm-host 进程** + fake-pi（复刻 skeleton 的 harness 形状，
 //! `/var/opt/Farm-ref/examples/orchestrator-skeleton/src/harness.rs` 与 `tests/common/mod.rs`）。
 //!
-//! 二进制定位优先级：`*_BIN` 环境变量 > `$CARGO_TARGET_DIR/debug/` > manifest 相对路径。
-//! 本仓的 `CARGO_TARGET_DIR` 是 worktree 本地的 target，宿主与替身都不在那里，所以跑 e2e 时
-//! **显式**给 `FARM_HOST_BIN` 与 `FAKE_PI_BIN`（`60-environment-and-risks.md` R5：不显式指定
-//! 就会静默 skip）。
+//! 二进制定位优先级：`*_BIN` 环境变量 > `$CARGO_TARGET_DIR/debug/` > 本仓 `target/debug/`
+//! （manifest 相对：workspace 根与 crate 目录都试）。本仓的 `CARGO_TARGET_DIR` 是 worktree
+//! 本地的 target，宿主与替身都不在那里，所以跑 e2e 时**显式**给 `FARM_HOST_BIN` 与
+//! `FAKE_PI_BIN`（`60-environment-and-risks.md` R5）；找不到就由 [`require_host_and_fake_pi`]
+//! **失败**（不是跳过）——这两条演练是票面的验收标准，零断言的绿不是绿。
 //!
 //! 编排器**只**需要宿主与 agent 替身：宿主自己按 env 装配替身，编排器不感知 agent 跑在哪
 //! （ADR-0001 决策 4 / ADR-0006），也不发通知（通知是宿主的活）。
@@ -36,14 +37,54 @@ pub fn fake_pi_bin() -> Option<PathBuf> {
     bin_from("FAKE_PI_BIN", "fake-pi")
 }
 
-/// `*_BIN` > `$CARGO_TARGET_DIR/debug/<name>`（skeleton 的优先序）。
+/// `*_BIN` > `$CARGO_TARGET_DIR/debug/<name>` > 本仓 `target/debug/<name>`（skeleton 的优先序，
+/// 最后一档算上 workspace 根：`cargo build` 从仓库根跑时二进制落在那里）。
 fn bin_from(env_var: &str, name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var(env_var) {
         return Some(PathBuf::from(path));
     }
-    let dir = std::env::var("CARGO_TARGET_DIR").ok()?;
-    let candidate = PathBuf::from(dir).join("debug").join(name);
-    candidate.exists().then_some(candidate)
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut candidates = Vec::new();
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        candidates.push(PathBuf::from(dir).join("debug").join(name));
+    }
+    // 本 crate 的 target（manifest 相对）与 workspace 根的 target。
+    candidates.push(manifest.join("target/debug").join(name));
+    candidates.push(manifest.join("../target/debug").join(name));
+    candidates.into_iter().find(|candidate| candidate.exists())
+}
+
+/// e2e 演练必需的两个二进制（真宿主 + agent 替身）；缺一个就 **panic**。
+///
+/// 演练是票 #4 / #5 的**验收标准**：找不到二进制就 `return` 的话，防空洞断言一条也不走，
+/// 测试却报绿（CI 里就是这个形状）。所以这里直接失败，并把「怎么装」写进消息。
+pub fn require_host_and_fake_pi() -> (PathBuf, PathBuf) {
+    let missing = |name: &str, var: &str| format!("{name}（{var}）：没找到");
+    let mut absent = Vec::new();
+    if host_bin().is_none() {
+        absent.push(missing("farm-host", "FARM_HOST_BIN"));
+    }
+    if fake_pi_bin().is_none() {
+        absent.push(missing("fake-pi", "FAKE_PI_BIN"));
+    }
+    assert!(
+        absent.is_empty(),
+        "e2e 演练需要真宿主与 agent 替身，但它们不到场：{}\n\
+         这两条演练是票面的验收标准，零断言的绿不是绿，所以这里直接失败而不是跳过。\n\
+         装法（任选）：\n\
+         1) 在 Farm 仓库里构建：\n\
+            git -C <Farm> checkout ec5fd3a869147d28366f74dbd07ed869574be914 \n\
+            cargo build --manifest-path <Farm>/Cargo.toml -p farm-host -p farm-core --bins\n\
+            然后：\n\
+            export FARM_HOST_BIN=<Farm>/target/debug/farm-host \n\
+            export FAKE_PI_BIN=<Farm>/target/debug/fake-pi \n\
+         2) 或把它们放进本仓的 target/debug/（`cargo test` 会自己在那里找）。",
+        absent.join("；")
+    );
+    (
+        host_bin().expect("刚查过存在"),
+        fake_pi_bin().expect("刚查过存在"),
+    )
 }
 
 /// 取一个临时回环端口（预绑 `:0` 拿 OS 分配的端口后放开，交给宿主 bind）。

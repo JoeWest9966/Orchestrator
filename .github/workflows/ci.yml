@@ -53,11 +53,48 @@ jobs:
       - name: Build
         run: CARGO_TARGET_DIR="$PWD/target" cargo build --locked --all-targets
 
-      - name: Test
-        run: CARGO_TARGET_DIR="$PWD/target" cargo test --locked
+      # 单测（lib）。两条演练（tests/dispatch_sequence.rs / tests/main_loop_e2e.rs）需要**真的**
+      # farm-host 与 fake-pi，二进制不到场时它们**失败**（不是跳过）——所以演练归下面的
+      # `drills` job，这里不跑（那边跑全套：`cargo test --locked`）。
+      - name: Test (unit tests)
+        run: CARGO_TARGET_DIR="$PWD/target" cargo test --locked --lib
 
       - name: Clippy (deny warnings)
         run: CARGO_TARGET_DIR="$PWD/target" cargo clippy --locked --all-targets -- -D warnings
 
       - name: Fmt check
         run: CARGO_TARGET_DIR="$PWD/target" cargo fmt --check
+
+  # 两条演练是票 #4 / #5 的验收标准，而它们要真的宿主与替身（替身住在 JoeWest9966/Farm 的
+  # 钉住 rev 上，本仓的 target 里没有）。二进制不到场时演练会**失败**（不是跳过：零断言的绿
+  # 不是绿），所以演练只有这一个出处。
+  drills:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      # 宿主与替身：与 Cargo.toml 里 farm-sdk 的 rev 钉在一起（同一枚 rev）。
+      - name: Check out Farm (the host + the fake agent, pinned rev)
+        uses: actions/checkout@v4
+        with:
+          repository: JoeWest9966/Farm
+          ref: ec5fd3a869147d28366f74dbd07ed869574be914
+          path: farm
+
+      - name: Build farm-host and the fakes
+        working-directory: farm
+        run: CARGO_TARGET_DIR="$PWD/target" cargo build --locked -p farm-host -p farm-core --bins
+
+      # `FARM_HOST_BIN` / `FAKE_PI_BIN` 显式给：它们不到场时演练会失败，而不是静默零断言通过。
+      - name: Test (unit + the e2e drills against a real farm-host)
+        env:
+          FARM_HOST_BIN: ${{ github.workspace }}/farm/target/debug/farm-host
+          FAKE_PI_BIN: ${{ github.workspace }}/farm/target/debug/fake-pi
+        run: CARGO_TARGET_DIR="$PWD/target" cargo test --locked

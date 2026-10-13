@@ -15,8 +15,9 @@
 //!    `.farm/workflow.json` 下编排器继续用 LKG 编排**并持续标注**（断言编排器日志）。
 //!
 //! 夹具形状照 skeleton（`tests/common/mod.rs` 的 `TestHost`：真 `farm-host` + fake-pi +
-//! tempdir）。找不到宿主 / fake-pi 就**跳过**（不 fail）；跑起来之后用「防空洞」断言检查
-//! 条数，保证「静默半途而废」不能伪装成绿。
+//! tempdir）。找不到宿主 / fake-pi 就**失败**（不跳过）：这三条演练是票面的验收标准，零断言
+//! 的绿不是绿（`common::require_host_and_fake_pi`）。跑起来之后用「防空洞」断言检查条数，
+//! 保证「静默半途而废」不能伪装成绿。
 
 mod common;
 
@@ -31,7 +32,7 @@ use farm_sdk::services::workspace::{WorktreeEstablishRequest, WorktreeState};
 use orchestrator::main_loop::{ENV_ASSIGNEE, ENV_HOST, ENV_WORKTREE_BRANCH, ENV_WORKTREE_PATH};
 
 use common::{
-    events_of_kind, fake_pi_bin, host_bin, poll, propose_merge, Checks, OrchestratorEnv,
+    events_of_kind, poll, propose_merge, require_host_and_fake_pi, Checks, OrchestratorEnv,
     OrchestratorRun, TestHost, SEED_LABEL,
 };
 
@@ -109,17 +110,6 @@ fn is_tick_line(line: &str) -> bool {
     line.contains(" tick ") && line.contains("decisions")
 }
 
-fn missing_binaries() -> bool {
-    if host_bin().is_none() || fake_pi_bin().is_none() {
-        eprintln!(
-            "farm-host 或 fake-pi 二进制没找到（显式给 FARM_HOST_BIN / FAKE_PI_BIN；\
-             CARGO_TARGET_DIR 是本 worktree 本地的 target，替身不在那里）；跳过 main_loop e2e"
-        );
-        return true;
-    }
-    false
-}
-
 /// 夹具前置：先建一条 spec ↔ 集成分支的映射（编排器的 `spec_id` / `integration_branch`
 /// 只能从 `GET /v1/workspace/mappings` 读，而映射只能由 establish 原语产生）。
 async fn bootstrap_mapping(
@@ -166,9 +156,7 @@ async fn wait_for_ticket_worktree(
 
 #[tokio::test]
 async fn one_ticket_goes_from_open_to_a_merge_event() {
-    if missing_binaries() {
-        return;
-    }
+    let (_host_bin, fake_pi) = require_host_and_fake_pi();
     let scratch = tempfile::tempdir().expect("scratch dir");
     let repo = scratch.path().join("repo");
     let worktrees = scratch.path().join("worktrees");
@@ -177,10 +165,7 @@ async fn one_ticket_goes_from_open_to_a_merge_event() {
     let host = TestHost::spawn(
         &[TICKET_NUMBER],
         &[
-            (
-                "FARM_AGENT_PROGRAM",
-                fake_pi_bin().unwrap().to_string_lossy().into_owned(),
-            ),
+            ("FARM_AGENT_PROGRAM", fake_pi.to_string_lossy().into_owned()),
             // `silence`：attempt 一直「在跑」⇒ 编排器不会重复派发（无双派的可观察量从这条起就成立）。
             ("FAKE_PI_SCENARIO", "silence".to_string()),
             (
@@ -333,9 +318,7 @@ async fn one_ticket_goes_from_open_to_a_merge_event() {
 
 #[tokio::test]
 async fn a_sigkill_then_a_restart_does_not_dispatch_twice() {
-    if missing_binaries() {
-        return;
-    }
+    let (_host_bin, fake_pi) = require_host_and_fake_pi();
     let scratch = tempfile::tempdir().expect("scratch dir");
     let repo = scratch.path().join("repo");
     let worktrees = scratch.path().join("worktrees");
@@ -344,10 +327,7 @@ async fn a_sigkill_then_a_restart_does_not_dispatch_twice() {
     let host = TestHost::spawn(
         &[TICKET_NUMBER],
         &[
-            (
-                "FARM_AGENT_PROGRAM",
-                fake_pi_bin().unwrap().to_string_lossy().into_owned(),
-            ),
+            ("FARM_AGENT_PROGRAM", fake_pi.to_string_lossy().into_owned()),
             ("FAKE_PI_SCENARIO", "silence".to_string()),
             (
                 "FARM_MERGE_TEST_COMMAND",
@@ -456,9 +436,7 @@ async fn a_sigkill_then_a_restart_does_not_dispatch_twice() {
 
 #[tokio::test]
 async fn a_corrupt_workflow_json_keeps_orchestrating_on_the_last_known_good() {
-    if missing_binaries() {
-        return;
-    }
+    let (_host_bin, fake_pi) = require_host_and_fake_pi();
     let scratch = tempfile::tempdir().expect("scratch dir");
     let repo = scratch.path().join("repo");
     let worktrees = scratch.path().join("worktrees");
@@ -468,10 +446,7 @@ async fn a_corrupt_workflow_json_keeps_orchestrating_on_the_last_known_good() {
     let host = TestHost::spawn(
         &[TICKET_NUMBER],
         &[
-            (
-                "FARM_AGENT_PROGRAM",
-                fake_pi_bin().unwrap().to_string_lossy().into_owned(),
-            ),
+            ("FARM_AGENT_PROGRAM", fake_pi.to_string_lossy().into_owned()),
             ("FAKE_PI_SCENARIO", "silence".to_string()),
             (
                 "FARM_MERGE_TEST_COMMAND",

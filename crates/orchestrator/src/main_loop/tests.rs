@@ -818,6 +818,48 @@ async fn a_tick_that_cannot_pin_the_repo_id_stays_idle_and_does_not_invent_a_con
 // (c) WS 入账
 // ---------------------------------------------------------------------------
 
+#[test]
+fn a_truncated_pull_does_not_latch_the_fallback_for_the_rest_of_the_process() {
+    // 「最近一页被截断」是宿主忙时的常态。截断位若 OR 起来永不清理，recon 的退化路径
+    // （完成信号回退 issues 快照）就成了稳态，history_truncated 的 WARN 每 tick 都响。
+    // 截断是**这一次读数**的性质 ⇒ 账上取当前那一页的读数。
+    let mut ledger = EventLedger::default();
+    ledger.absorb(&EventHistoryResponse {
+        events: vec![ticket_event(
+            "e-1",
+            EventKind::Dispatch,
+            "2026-01-01T00:00:05Z",
+            "attempt-1",
+        )],
+        truncated: true,
+    });
+    assert!(ledger.page().truncated, "截断的那一页如实记着截断");
+
+    ledger.absorb(&EventHistoryResponse {
+        events: Vec::new(),
+        truncated: false,
+    });
+    assert!(
+        !ledger.page().truncated,
+        "下一页不截断 ⇒ 账上不再说截断（截断位不粘）"
+    );
+
+    // 退化路径的判据就是账上的这个位：不截断 − 不得从 issues 快照里把 done 当完成信号。
+    let world = recon::rebuild(
+        ASSIGNEE,
+        &issues(Some(ASSIGNEE), IssueState::Done),
+        &ledger.page(),
+        &mappings(Vec::new()),
+        None,
+        &RetryBackoff::default(),
+    );
+    assert!(
+        world.merge_done.is_empty(),
+        "不截断就不走 issues 快照的完成信号兜底，得到 {:?}",
+        world.merge_done
+    );
+}
+
 #[tokio::test]
 async fn a_newer_page_followed_by_an_older_one_still_shows_the_attempt_as_active() {
     // 事件账的两路来源（WS 快照 = 整个保留窗口；HTTP 增量页 = 最近一页）以**到达顺序**混进

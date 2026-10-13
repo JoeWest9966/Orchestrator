@@ -264,6 +264,9 @@ fn required(
 pub struct EventLedger {
     events: Vec<EventEnvelope>,
     seen: std::collections::BTreeSet<String>,
+    /// **当前**那一页增量拉取的读数：它是不是被保留窗口截断。
+    ///
+    /// 不是历史累积（一次截断不该把退化路径钉成稳态）：下一次不截断的拉取就把它清掉。
     truncated: bool,
 }
 
@@ -282,11 +285,14 @@ impl EventLedger {
     }
 
     /// 入账一页事件历史（增量拉取的读数）。
+    ///
+    /// 截断位每次拉取**重取**（取当前那一页的读数），不 OR 进账里：宿主忙时「最近一页被截断」
+    /// 是常态，钉住它等于把 `recon` 的退化路径（完成信号回退 issues 快照）钉成稳态。
     pub fn absorb(&mut self, page: &EventHistoryResponse) {
         for envelope in &page.events {
             self.append(envelope.clone());
         }
-        self.truncated |= page.truncated;
+        self.truncated = page.truncated;
     }
 
     /// 交给 `recon::rebuild` 的那一段：整本账（已按 `occurred_at` 升序）。

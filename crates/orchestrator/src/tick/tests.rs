@@ -389,7 +389,7 @@ fn claims_taken_in_one_tick_are_dispatched_within_the_quota_in_the_next() {
     let tick_one = decide(&WorldModel::default(), &issues, &config, NOW);
     assert_eq!(tick_one, vec![claim("T1"), claim("T2")]);
 
-    // 执行器打完 claim、对账重建之后的世界：两张票归我，还没有活跃 attempt。
+    // 派发序列打完 claim、对账重建之后的世界：两张票归我，还没有活跃 attempt。
     let mut world = WorldModel::default();
     for decision in &tick_one {
         if let Decision::Claim { ticket_id } = decision {

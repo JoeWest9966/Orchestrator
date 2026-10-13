@@ -7,8 +7,8 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 
 use farm_sdk::events::EventKind;
 use farm_sdk::handshake::{ClientInfo, ClientKind, HandshakeRequest, HandshakeResponse};
@@ -24,6 +24,7 @@ use farm_sdk::workflow::{
 use farm_sdk::{ContractError, ErrorCode, ServiceName};
 
 use super::client::ContractClient;
+use crate::test_support::{read_request, CapturedRequest};
 
 // ---------------------------------------------------------------------------
 // 内存内假宿主
@@ -74,25 +75,7 @@ fn json_ok<T: serde::Serialize>(value: &T) -> CannedResponse {
     )
 }
 
-/// 一条已收到的请求（供断言客户端真的按契约发请求）。
-#[derive(Clone, Debug, Default)]
-struct CapturedRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: String,
-}
-
-impl CapturedRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-/// 假宿主：按连接序返回 `responses`，并把每个收到的请求记进 `requests`。
+// 假宿主：按连接序返回 `responses`，并把每个收到的请求记进 `requests`。
 struct FakeHost {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
@@ -144,59 +127,6 @@ impl FakeHost {
     fn request_count(&self) -> usize {
         self.requests.lock().expect("requests lock").len()
     }
-}
-
-/// 读一条完整的 HTTP/1.1 请求（请求行 + header + `Content-Length` 指定的 body）。
-async fn read_request(socket: &mut TcpStream) -> CapturedRequest {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = socket.read(&mut chunk).await.unwrap_or(0);
-        if read == 0 {
-            return CapturedRequest::default();
-        }
-        buf.extend_from_slice(&chunk[..read]);
-        let Some(head_end) = find_subslice(&buf, b"\r\n\r\n") else {
-            continue;
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-        let mut lines = head.lines();
-        let request_line = lines.next().unwrap_or_default().to_string();
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let path = parts.next().unwrap_or_default().to_string();
-        let headers: Vec<(String, String)> = lines
-            .filter_map(|line| {
-                line.split_once(": ")
-                    .map(|(key, value)| (key.to_ascii_lowercase(), value.to_string()))
-            })
-            .collect();
-        let content_length: usize = headers
-            .iter()
-            .find(|(key, _)| key == "content-length")
-            .and_then(|(_, value)| value.parse().ok())
-            .unwrap_or(0);
-        let mut body = buf[head_end + 4..].to_vec();
-        while body.len() < content_length {
-            let read = socket.read(&mut chunk).await.unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-        return CapturedRequest {
-            method,
-            path,
-            headers,
-            body: String::from_utf8_lossy(&body).into_owned(),
-        };
-    }
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -649,4 +579,27 @@ async fn an_unreachable_host_is_a_retryable_service_unavailable() {
 
     assert_eq!(err.code, ErrorCode::ServiceUnavailable);
     assert!(err.retryable);
+}
+
+#[test]
+fn the_admin_repo_path_is_rendered_from_the_route_table_not_hand_written() {
+    use farm_sdk::routes::ADMIN_ROUTES;
+
+    // 表里必须恰好有一条含 `/workflow/config/` 的路由，且带 `{repo_id}` 占位符——
+    // 否则 `admin_repo_path` 的查找键就失效了（它会 panic，这里是它的守卫测试）。
+    let templates: Vec<&str> = ADMIN_ROUTES
+        .iter()
+        .map(|route| route.path)
+        .filter(|path| path.contains("/workflow/config/"))
+        .collect();
+    assert_eq!(templates.len(), 1, "{templates:?}");
+    assert!(templates[0].contains("{repo_id}"), "{}", templates[0]);
+
+    // 实路径 = 表模板把占位符换成 repo_id（表里的 path 已含 `/admin` 前缀，不再拼一次）。
+    let expected = templates[0].replace("{repo_id}", "spec%2F10");
+    assert_eq!(
+        super::client::admin_repo_path("spec/10"),
+        expected,
+        "the path must come from ADMIN_ROUTES, not from a literal in the client"
+    );
 }

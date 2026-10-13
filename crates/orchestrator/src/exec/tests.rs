@@ -8,8 +8,8 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 
 use farm_sdk::services::agent_runner::{AttemptState, DispatchRequest, DispatchResponse};
 use farm_sdk::services::tracker::{
@@ -25,6 +25,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use crate::contract::client::ContractClient;
 
 use super::*;
+use crate::test_support::{read_request, CapturedRequest};
 
 // ---------------------------------------------------------------------------
 // 夹具字面量（期望值的独立来源）
@@ -186,18 +187,10 @@ fn err(code: ErrorCode) -> Canned {
     }
 }
 
-/// 一条已收到的请求。
-#[derive(Clone, Debug, Default)]
-struct Sent {
-    method: String,
-    path: String,
-    body: String,
-}
-
 /// 假宿主：顺序吐出预设响应。
 struct FakeHost {
     addr: SocketAddr,
-    sent: Arc<Mutex<Vec<Sent>>>,
+    sent: Arc<Mutex<Vec<CapturedRequest>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -233,7 +226,7 @@ impl FakeHost {
         ContractClient::new(self.addr, "op-token", None)
     }
 
-    fn sent(&self) -> Vec<Sent> {
+    fn sent(&self) -> Vec<CapturedRequest> {
         self.sent.lock().expect("sent lock").clone()
     }
 
@@ -243,53 +236,8 @@ impl FakeHost {
     }
 }
 
-/// 读一条完整的 HTTP/1.1 请求（请求行 + header + `Content-Length` 指定的 body）。
-async fn read_request(socket: &mut TcpStream) -> Sent {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = socket.read(&mut chunk).await.unwrap_or(0);
-        if read == 0 {
-            return Sent::default();
-        }
-        buf.extend_from_slice(&chunk[..read]);
-        let Some(head_end) = find_subslice(&buf, b"\r\n\r\n") else {
-            continue;
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-        let mut lines = head.lines();
-        let request_line = lines.next().unwrap_or_default().to_string();
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let request_path = parts.next().unwrap_or_default().to_string();
-        let content_length: usize = lines
-            .filter_map(|line| line.split_once(": "))
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.parse().ok())
-            .unwrap_or(0);
-        let mut body = buf[head_end + 4..].to_vec();
-        while body.len() < content_length {
-            let read = socket.read(&mut chunk).await.unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-        return Sent {
-            method,
-            path: request_path,
-            body: String::from_utf8_lossy(&body).into_owned(),
-        };
-    }
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn decode<T: serde::de::DeserializeOwned>(sent: &Sent) -> T {
+/// 把假宿主收到的请求体解析成契约类型（期望值因此来自契约类型，不是手写 JSON）。
+fn decode<T: serde::de::DeserializeOwned>(sent: &CapturedRequest) -> T {
     serde_json::from_str(&sent.body).expect("request body deserializes into the contract type")
 }
 
@@ -852,7 +800,7 @@ async fn a_retryable_release_failure_is_retried_and_a_hard_one_cools_down() {
 #[test]
 fn the_exec_module_folds_no_events_runs_no_projection_and_shells_out_to_nothing() {
     // 事件的折叠是 recon 的单一源；投影是宿主的机械动作；git / worktree 的建立是 workspace
-    // 服务的活。执行器只发契约调用——这些 token 一个都不该出现在实现里。
+    // 服务的活。本模块只发契约调用——这些 token 一个都不该出现在实现里。
     let source = include_str!("mod.rs");
     for forbidden in [
         "EventKind",          // 不重新解释事件（recon 折叠，exec 不重复）

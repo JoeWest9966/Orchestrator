@@ -16,6 +16,7 @@
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, TcpListener};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -26,6 +27,10 @@ use tokio::net::TcpStream;
 /// 播种票的标签：夹具里唯一的 dispatchable 标签（与测试侧 `.farm/workflow.json` 的
 /// `dispatch_labels` 必须一致）。
 pub const SEED_LABEL: &str = "dispatch";
+
+/// 两个演练共用的被编排 spec 与集成分支（同一份工作区，只有一处定义）。
+pub const SPEC: &str = "spec-10";
+pub const INTEGRATION: &str = "implement/spec-10";
 
 /// 定位 `farm-host` 二进制。
 pub fn host_bin() -> Option<PathBuf> {
@@ -85,6 +90,38 @@ pub fn require_host_and_fake_pi() -> (PathBuf, PathBuf) {
         host_bin().expect("刚查过存在"),
         fake_pi_bin().expect("刚查过存在"),
     )
+}
+
+/// scratch 仓库：`main` + 集成分支 + 仓库里的 `.farm/workflow.json`（宿主读它做生效配置）。
+///
+/// 两个集成测试目标（派发序列 / 主循环演练）各要一个，所以住在这里——只有一份。
+pub fn scaffold_repo(repo: &Path, workflow: &str) {
+    std::fs::create_dir_all(repo).expect("create repo dir");
+    git(repo, &["init", "--initial-branch=main"]);
+    git(repo, &["config", "user.email", "orchestrator@farm.local"]);
+    git(repo, &["config", "user.name", "Orchestrator E2E"]);
+    std::fs::write(repo.join("README.md"), "orchestrator e2e scratch\n").expect("readme");
+    std::fs::create_dir_all(repo.join(".farm")).expect("mkdir .farm");
+    std::fs::write(repo.join(".farm/workflow.json"), workflow).expect("workflow.json");
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "init"]);
+    git(repo, &["branch", INTEGRATION]);
+}
+
+/// 在 `cwd` 里跑一条 git 命令，失败就 panic（stdout 原样返回）。
+pub fn git(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// 取一个临时回环端口（预绑 `:0` 拿 OS 分配的端口后放开，交给宿主 bind）。

@@ -22,7 +22,6 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use farm_sdk::events::EventKind;
@@ -32,8 +31,8 @@ use farm_sdk::services::workspace::{WorktreeEstablishRequest, WorktreeState};
 use orchestrator::main_loop::{ENV_ASSIGNEE, ENV_HOST, ENV_WORKTREE_BRANCH, ENV_WORKTREE_PATH};
 
 use common::{
-    events_of_kind, poll, propose_merge, require_host_and_fake_pi, Checks, OrchestratorEnv,
-    OrchestratorRun, TestHost, SEED_LABEL,
+    events_of_kind, git, poll, propose_merge, require_host_and_fake_pi, scaffold_repo, Checks,
+    OrchestratorEnv, OrchestratorRun, TestHost, INTEGRATION, SEED_LABEL, SPEC,
 };
 
 /// 被编排的那张票（宿主播种的原生票号即票 id）。
@@ -44,8 +43,6 @@ const TICKET_NUMBER: u32 = 7;
 /// 它**不是**一张被播种的 issue（只在 workspace 映射里存在）：这样它不会挤进 frontier 抢
 /// 并发配额——编排器要编排的只有 [`TICKET`]。
 const SEED_TICKET: &str = "seed";
-const SPEC: &str = "spec-10";
-const INTEGRATION: &str = "implement/spec-10";
 
 /// 已生效的 workflow 配置（宿主在建立 worktree 时从 `.farm/workflow.json` 装载它）。
 ///
@@ -55,35 +52,6 @@ fn workflow_json() -> String {
     format!(
         r#"{{"dispatch_labels":["{SEED_LABEL}"],"max_concurrency":1,"stall_threshold_secs":3600,"prompt_template":"work on {{{{ticket_id}}}}","retry_backoff":{{"max_retries":2,"base_delay_ms":1000,"backoff_multiplier":2}},"projection":{{"close_issue":true,"open_pr":false,"comment_merge_commit":false,"add_label":false}}}}"#
     )
-}
-
-/// scratch 仓库：`main` + 集成分支 + 仓库里的 `.farm/workflow.json`（宿主读它做生效配置）。
-fn scaffold_repo(repo: &Path, workflow: &str) {
-    std::fs::create_dir_all(repo).expect("create repo dir");
-    git(repo, &["init", "--initial-branch=main"]);
-    git(repo, &["config", "user.email", "orchestrator@farm.local"]);
-    git(repo, &["config", "user.name", "Orchestrator E2E"]);
-    std::fs::write(repo.join("README.md"), "main-loop e2e scratch\n").expect("readme");
-    std::fs::create_dir_all(repo.join(".farm")).expect("mkdir .farm");
-    std::fs::write(repo.join(".farm/workflow.json"), workflow).expect("workflow.json");
-    git(repo, &["add", "."]);
-    git(repo, &["commit", "-m", "init"]);
-    git(repo, &["branch", INTEGRATION]);
-}
-
-fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .expect("spawn git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// 写一个「测试过」闸门的脚本（`FARM_MERGE_TEST_COMMAND` 指向它）：退出 0 = 测试过。

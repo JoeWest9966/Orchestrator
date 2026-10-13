@@ -348,6 +348,10 @@ pub struct TickReport {
     pub decisions: Vec<Decision>,
     /// 逐决策的执行结局（与决策表同序）。
     pub outcomes: Vec<TickOutcome>,
+    /// 本 tick 是否被一条硬失败**截断**：遇到 [`Outcome::HardFailure`] 就不再发余下的
+    /// 契约调用（`exec` 的 `Disposition::Fatal` 语义，见 `exec` 模块头的分流表）。
+    /// 值是截断本 tick 的那张票——`None` = 没被截断。
+    pub cut_short_by: Option<String>,
 }
 
 /// 跑一个完整的 tick（模块头的六步）。
@@ -476,19 +480,22 @@ pub async fn tick_once(
 
     // 6. execute：逐决策打契约调用。ADR-0004：`effective == None` ⇒ 无执行面（idle）。
     let mut outcomes = Vec::with_capacity(decisions.len());
+    let mut cut_short_by: Option<String> = None;
     if let Some(workflow) = effective.effective.clone() {
         for decision in &decisions {
             let outcome = match decision {
                 Decision::Claim { ticket_id } => {
+                    // `claimed == false` 的解释只有一处（`exec::interpret_claim`）：契约说这就是
+                    // 「已被他人持有」。
                     match client.claim(ticket_id, &config.assignee).await {
-                        Ok(response) if response.claimed => TickOutcome::Claimed {
-                            ticket_id: ticket_id.clone(),
-                        },
-                        // 2xx 但 `claimed == false`：`ClaimResponse` 的契约注释说这就是「已被他人
-                        // 持有」的语义（调用方本会收到 `conflict`）。与 `exec` 的同一处映射同款。
-                        Ok(_) => TickOutcome::ClaimRefused {
-                            ticket_id: ticket_id.clone(),
-                            code: ErrorCode::Conflict,
+                        Ok(response) => match exec::interpret_claim(&response) {
+                            Ok(()) => TickOutcome::Claimed {
+                                ticket_id: ticket_id.clone(),
+                            },
+                            Err(code) => TickOutcome::ClaimRefused {
+                                ticket_id: ticket_id.clone(),
+                                code,
+                            },
                         },
                         Err(error) => TickOutcome::ClaimRefused {
                             ticket_id: ticket_id.clone(),
@@ -527,7 +534,21 @@ pub async fn tick_once(
                 outcome = ?outcome,
                 "decision executed"
             );
+            let fatal = is_fatal(&outcome);
+            let ticket = outcome_ticket(&outcome).to_string();
             outcomes.push(outcome);
+            // `Disposition::Fatal` 的语义（`exec` 模块头分流表）：硬失败之后，本 tick 余下的
+            // 序列**不再发契约调用**。凭据/契约版本/路由这类失败对每个决策都会同样失败，
+            // 继续打只是把同一个错误重复 N 次、并把 N 张票都拖进回滚。
+            if fatal {
+                tracing::warn!(
+                    alert = "tick_cut_short",
+                    ticket = ticket.as_str(),
+                    "硬失败：本 tick 余下的序列不再发契约调用"
+                );
+                cut_short_by = Some(ticket);
+                break;
+            }
         }
     }
 
@@ -558,6 +579,28 @@ pub async fn tick_once(
         source: effective.source,
         decisions,
         outcomes,
+        cut_short_by,
+    }
+}
+
+/// 这条结局是不是「本 tick 余下的序列不再发契约调用」的那一种。
+fn is_fatal(outcome: &TickOutcome) -> bool {
+    matches!(
+        outcome,
+        TickOutcome::Dispatch {
+            outcome: Outcome::HardFailure { .. },
+            ..
+        }
+    )
+}
+
+/// 一条执行结局针对的那张票。
+fn outcome_ticket(outcome: &TickOutcome) -> &str {
+    match outcome {
+        TickOutcome::Claimed { ticket_id }
+        | TickOutcome::ClaimRefused { ticket_id, .. }
+        | TickOutcome::Dispatch { ticket_id, .. }
+        | TickOutcome::Release { ticket_id, .. } => ticket_id,
     }
 }
 
@@ -585,28 +628,11 @@ fn cooldown_of(outcome: &TickOutcome) -> Option<&exec::Cooldown> {
 
 /// repo_id（生效配置的键）：先按「我名下票的 worktree 所属 spec」，退到「唯一一条映射」。
 ///
-/// 推不出就返回 `None`：本 tick idle + 告警，不猜配置归属——多条并存时没有任何契约字段能
-/// 指出「本编排器的那条」（与 [`exec`] 对 mappings 的同一条判据）。
+/// 挑映射的判据只有一处（[`exec::select_mapping`]）：先按票挑、唯一映射兜底、多条并存不猜。
+/// 推不出就返回 `None`：本 tick idle + 告警，不猜配置归属。
 fn repo_id<'a>(mappings: &'a MappingListResponse, world: &WorldModel) -> Option<&'a str> {
-    let mine: Vec<&str> = mappings
-        .mappings
-        .iter()
-        .filter(|mapping| {
-            mapping
-                .worktrees
-                .iter()
-                .any(|worktree| world.claimed_by_me.contains(worktree.ticket_id.as_str()))
-        })
+    exec::select_mapping(mappings, |ticket| world.claimed_by_me.contains(ticket))
         .map(|mapping| mapping.spec_id.as_str())
-        .collect();
-    match mine.as_slice() {
-        // 确定性：同一份读数下挑出的恒是同一条（映射顺序不保证，取字典序最小的那条）。
-        [_, ..] => mine.into_iter().min(),
-        [] => match mappings.mappings.as_slice() {
-            [mapping] => Some(mapping.spec_id.as_str()),
-            _ => None,
-        },
-    }
 }
 
 /// ADR-0004 的三态标注（只读该端点，从不尝试写配置）：

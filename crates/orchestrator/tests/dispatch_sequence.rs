@@ -12,7 +12,6 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 
 use farm_sdk::events::EventKind;
 use farm_sdk::handshake::CONTRACT_VERSION;
@@ -21,7 +20,7 @@ use farm_sdk::services::tracker::IssueState;
 use farm_sdk::services::workspace::{WorktreeEstablishRequest, WorktreeState};
 use orchestrator::exec::{dispatch_ticket, Outcome, WorktreeLayout};
 
-use common::{require_host_and_fake_pi, Checks, TestHost, SEED_LABEL};
+use common::{require_host_and_fake_pi, scaffold_repo, Checks, TestHost, INTEGRATION, SPEC};
 
 /// 被派发的那张票（宿主播种的原生票号即票 id）。
 const TICKET: &str = "7";
@@ -32,45 +31,14 @@ const SEED_TICKET_NUMBER: u32 = 101;
 /// claim 身份（`FARM_ASSIGNEE`）。
 const ASSIGNEE: &str = "orchestrator-e2e";
 /// 已生效的 workflow 配置：宿主在建立 worktree 时从 `.farm/workflow.json` 装载它。
-const SPEC: &str = "spec-10";
-const INTEGRATION: &str = "implement/spec-10";
 const WORKTREE_BRANCH: &str = "farm/t7";
+/// 已生效的 workflow 配置（宿主在建立 worktree 时从 `.farm/workflow.json` 装载它）。
+///
+/// `projection.close_issue = true`：merge 之后宿主把票机械标成 `done`（完成信号的投影）。
+const WORKFLOW_JSON: &str = r#"{"dispatch_labels":["dispatch"],"max_concurrency":1,"stall_threshold_secs":3600,"prompt_template":"work on {{ticket_id}}","retry_backoff":{"max_retries":2,"base_delay_ms":1000,"backoff_multiplier":2},"projection":{"close_issue":true,"open_pr":false,"comment_merge_commit":false,"add_label":false}}"#;
+
 /// 机械断言的下限（防空洞）。
 const MIN_CHECKS: usize = 10;
-
-/// scratch 仓库：`main` + 集成分支 + 仓库里的 `.farm/workflow.json`（宿主读它做生效配置）。
-fn scaffold_repo(repo: &Path) {
-    std::fs::create_dir_all(repo).expect("create repo dir");
-    git(repo, &["init", "--initial-branch=main"]);
-    git(repo, &["config", "user.email", "orchestrator@farm.local"]);
-    git(repo, &["config", "user.name", "Orchestrator E2E"]);
-    std::fs::write(repo.join("README.md"), "dispatch-sequence e2e scratch\n").expect("readme");
-    std::fs::create_dir_all(repo.join(".farm")).expect("mkdir .farm");
-    std::fs::write(
-        repo.join(".farm/workflow.json"),
-        format!(
-            r#"{{"dispatch_labels":["{SEED_LABEL}"],"max_concurrency":1,"stall_threshold_secs":3600,"prompt_template":"work on {{{{ticket_id}}}}","retry_backoff":{{"max_retries":2,"base_delay_ms":1000,"backoff_multiplier":2}},"projection":{{"close_issue":true,"open_pr":false,"comment_merge_commit":false,"add_label":false}}}}"#
-        ),
-    )
-    .expect("workflow.json");
-    git(repo, &["add", "."]);
-    git(repo, &["commit", "-m", "init"]);
-    git(repo, &["branch", INTEGRATION]);
-}
-
-fn git(cwd: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .expect("spawn git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 
 #[tokio::test]
 async fn one_ticket_goes_from_claim_to_a_successful_dispatch_against_a_real_host() {
@@ -78,7 +46,7 @@ async fn one_ticket_goes_from_claim_to_a_successful_dispatch_against_a_real_host
 
     let scratch = tempfile::tempdir().expect("scratch dir");
     let repo = scratch.path().join("repo");
-    scaffold_repo(&repo);
+    scaffold_repo(&repo, WORKFLOW_JSON);
     let worktrees = scratch.path().join("worktrees");
 
     let host = TestHost::spawn(

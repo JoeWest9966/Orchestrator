@@ -251,10 +251,15 @@ fn required(
 // 事件账（ADR-0001 决策 2）
 // ---------------------------------------------------------------------------
 
-/// 事件账：append-only、按事件 id 去重、游标 = 最后一条已入账事件的 `occurred_at`。
+/// 事件账：按 `occurred_at` **定序**、按事件 id 去重、游标 = 账上最新事件的 `occurred_at`。
 ///
 /// WS 任务与 tick 的增量拉取都往这里追加（两路是同一个事实，去重后只留一份）。它是**账**
 /// 不是世界：`WorldModel` 仍然只由下一个 tick 的 reconcile 推出（ADR-0001 决策 3）。
+///
+/// **顺序是账的职责**：两路来源以**到达顺序**混进来（WS 一条一条推、HTTP 一次一页拉），
+/// 而 `recon::rebuild` 的折叠要求宿主时间序（`occurred_at` 升序）——它不是调用方能给的：
+/// WS 推来的是整个保留窗口，HTTP 拉来的是最近一页，两边的区间可以交错甚至倒挂。所以入账
+/// 就地插进有序位置，账上的顺序恒是时间序。
 #[derive(Debug, Default)]
 pub struct EventLedger {
     events: Vec<EventEnvelope>,
@@ -268,7 +273,12 @@ impl EventLedger {
         if !self.seen.insert(envelope.id.clone()) {
             return;
         }
-        self.events.push(envelope);
+        // 保持 `occurred_at` 升序（稳定插入：与它同一时刻的都已排在它前面，故同一秒内仍然是
+        // 到达顺序——契约只给到秒级，再细的序推不出就不推）。
+        let position = self
+            .events
+            .partition_point(|existing| existing.occurred_at <= envelope.occurred_at);
+        self.events.insert(position, envelope);
     }
 
     /// 入账一页事件历史（增量拉取的读数）。
@@ -279,7 +289,7 @@ impl EventLedger {
         self.truncated |= page.truncated;
     }
 
-    /// 交给 `recon::rebuild` 的那一段：整本账。
+    /// 交给 `recon::rebuild` 的那一段：整本账（已按 `occurred_at` 升序）。
     pub fn page(&self) -> EventHistoryResponse {
         EventHistoryResponse {
             events: self.events.clone(),
@@ -287,7 +297,7 @@ impl EventLedger {
         }
     }
 
-    /// 账上最后一条已入账事件的 `occurred_at`（`None` = 账还是空的）。
+    /// 账上**最新**事件的 `occurred_at`（`None` = 账还是空的）——下一次增量拉取的 `since` 下界。
     pub fn watermark(&self) -> Option<&str> {
         self.events.last().map(|event| event.occurred_at.as_str())
     }

@@ -279,6 +279,20 @@ fn merge_event() -> EventEnvelope {
     }
 }
 
+/// 一张票的某类事件（宿主事件时间戳形状的时间）。
+fn ticket_event(id: &str, kind: EventKind, occurred_at: &str, attempt_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        id: id.to_string(),
+        kind,
+        occurred_at: occurred_at.to_string(),
+        actor: "host".to_string(),
+        ticket_id: Some(TICKET.to_string()),
+        attempt_id: Some(attempt_id.to_string()),
+        payload: serde_json::Value::Null,
+        audited: false,
+    }
+}
+
 fn test_config(addr: SocketAddr) -> OrchestratorConfig {
     OrchestratorConfig {
         host: addr,
@@ -803,6 +817,54 @@ async fn a_tick_that_cannot_pin_the_repo_id_stays_idle_and_does_not_invent_a_con
 // ---------------------------------------------------------------------------
 // (c) WS 入账
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_newer_page_followed_by_an_older_one_still_shows_the_attempt_as_active() {
+    // 事件账的两路来源（WS 快照 = 整个保留窗口；HTTP 增量页 = 最近一页）以**到达顺序**混进
+    // 同一本账：宿主忙时/重启后，账上的到达顺序会是「较新的一页 ++ 较旧的一页」。按到达顺序
+    // 折叠，一条比活跃 dispatch **更早**的终态事件会覆盖掉 active_attempts，于是 decide 会
+    // 重新派发一张正在跑的票（`a_sigkill_then_a_restart_does_not_dispatch_twice` 守的正是这条
+    // 不变量）。所以折叠用的是 `occurred_at`（契约唯一能给的顺序），不是到达顺序。
+    let mut ledger = EventLedger::default();
+    ledger.absorb(&EventHistoryResponse {
+        events: vec![ticket_event(
+            "e-newer",
+            EventKind::Dispatch,
+            "2026-01-01T00:00:10Z",
+            "attempt-1",
+        )],
+        truncated: false,
+    });
+    ledger.absorb(&EventHistoryResponse {
+        events: vec![ticket_event(
+            "e-older",
+            EventKind::Interrupted,
+            "2026-01-01T00:00:09Z",
+            "attempt-0",
+        )],
+        truncated: false,
+    });
+
+    let world = recon::rebuild(
+        ASSIGNEE,
+        &issues(Some(ASSIGNEE), IssueState::Claimed),
+        &ledger.page(),
+        &mappings(Vec::new()),
+        None,
+        &RetryBackoff::default(),
+    );
+
+    assert_eq!(
+        world.active_attempts,
+        BTreeMap::from([(TICKET.to_string(), Some("attempt-1".to_string()))]),
+        "比 dispatch 更早的终态事件不得结束这个 attempt（否则会重派一张在跑的票）"
+    );
+    assert_eq!(
+        world.event_watermark.as_deref(),
+        Some("2026-01-01T00:00:10Z"),
+        "游标 = 账上最新事件的 occurred_at，而不是最后到达的那一条"
+    );
+}
 
 #[test]
 fn the_event_ledger_is_append_only_dedupes_by_id_and_keeps_the_cursor_at_the_tail() {

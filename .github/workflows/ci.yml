@@ -1,0 +1,57 @@
+name: Orchestrator CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+
+      # ADR-0003：farm-sdk 的唯一来源是钉住 rev 的 git 依赖。crates.io 上没有这个 SDK，
+      # 也不能退化成 path 依赖。path 依赖的 `source` 是 `null`、registry 依赖以
+      # `registry+` 开头——下面两条断言把它们都拒掉。
+      - name: Assert farm-sdk comes from git (not a path or registry dependency)
+        run: |
+          cargo metadata --format-version 1 --locked |
+            jq -e '
+              .packages[]
+              | select(.name == "farm-sdk")
+              | .source
+              | select(. != null)
+              | startswith("git+https://github.com/JoeWest9966/Farm")
+            ' > /dev/null
+
+      - name: Assert farm-sdk is pinned to the exact rev
+        run: |
+          cargo metadata --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "farm-sdk") | .source' |
+            grep -F 'rev=ec5fd3a869147d28366f74dbd07ed869574be914'
+
+      # §4.2：契约主版本被钉住——编译期常量 1 + 运行时握手核对该主版本。
+      - name: Assert the pinned contract major
+        run: |
+          CARGO_TARGET_DIR="$PWD/target" cargo test --locked -p orchestrator \
+            --lib -- contract_major --exact
+
+      - name: Build
+        run: CARGO_TARGET_DIR="$PWD/target" cargo build --locked --all-targets
+
+      - name: Test
+        run: CARGO_TARGET_DIR="$PWD/target" cargo test --locked
+
+      - name: Clippy (deny warnings)
+        run: CARGO_TARGET_DIR="$PWD/target" cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Fmt check
+        run: CARGO_TARGET_DIR="$PWD/target" cargo fmt --check

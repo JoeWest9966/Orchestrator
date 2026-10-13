@@ -91,7 +91,7 @@ pub fn rebuild(
             let delay_ms = cooldown_delay_ms(retry_backoff, *trigger);
             backoff_until.insert(
                 ticket_id.to_string(),
-                deadline(&event.occurred_at, delay_ms),
+                cooldown_deadline(&event.occurred_at, delay_ms),
             );
         }
     }
@@ -294,7 +294,12 @@ fn cooldown_delay_ms(retry_backoff: &RetryBackoff, trigger: u32) -> u64 {
 ///
 /// 亚秒延迟按宿主 `canonical_timestamp` 的同一做法截断到秒；触发时刻不是宿主形状
 /// （带偏移量、亚秒精度等）时不猜延迟，记触发时刻本身——退避丢失可接受，编造时间戳不可接受。
-fn deadline(occurred_at: &str, delay_ms: u64) -> String {
+///
+/// `pub(crate)`：tick 循环（`crate::main_loop`）把 `exec` 失败回滚交回的 [`Cooldown`]
+/// 折进世界时，也走这一处换算——冷却的截止时刻算术只有这一处实现。
+///
+/// [`Cooldown`]: crate::exec::Cooldown
+pub(crate) fn cooldown_deadline(occurred_at: &str, delay_ms: u64) -> String {
     match parse_host_timestamp(occurred_at) {
         Some(epoch_secs) => format_host_timestamp(epoch_secs + (delay_ms / 1_000) as i64),
         None => occurred_at.to_string(),

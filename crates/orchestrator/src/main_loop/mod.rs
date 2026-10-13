@@ -338,6 +338,9 @@ pub struct TickReport {
 ///
 /// `world` 是上一个 tick 重建出的世界（就地刷新）；`now` 是本 tick 注入的钟面
 /// （RFC3339、UTC、秒级，见模块头）。读不到某一份读数时**不猜**：告警 + 本 tick 不编排。
+///
+/// 世界里的 `backoff_until` 是**两路**冷却的并集：事件流折叠出的（`recon`）与 `exec` 失败
+/// 回滚交回的（本模块折进，见函数里的第 6b 步）。
 pub async fn tick_once(
     client: &ContractClient,
     config: &OrchestratorConfig,
@@ -417,6 +420,16 @@ pub async fn tick_once(
     }
 
     // 4. reconcile：整本账 + 视图 + 映射 → 世界。
+    //
+    // 冷却登记是**累积**的：还没到期的截止时刻不因重建（只看得见事件）而消失，因为
+    // `exec` 的失败回滚记的冷却在事件面没有对应事件（宿主不会为一次没起来的 dispatch 发
+    // 事件）。这里把上一个世界里还没到期的截止时刻搬过来，取两者中更晚的那个。
+    let carried: Vec<(String, String)> = world
+        .backoff_until
+        .iter()
+        .filter(|(_, deadline)| deadline.as_str() > now)
+        .map(|(ticket, deadline)| (ticket.clone(), deadline.clone()))
+        .collect();
     let (page, ledger_watermark) = {
         let account = ledger.lock().expect("事件账锁未被毒化");
         (account.page(), account.watermark().map(str::to_string))
@@ -435,6 +448,12 @@ pub async fn tick_once(
         previous_watermark.as_deref(),
         &retry_backoff,
     );
+    for (ticket_id, deadline) in carried {
+        let kept = world.backoff_until.entry(ticket_id).or_default();
+        if *kept < deadline {
+            *kept = deadline;
+        }
+    }
 
     // 5. decide（纯函数；`now` 是注入的钟面，不在这里取时钟）。
     let decisions = tick::decide(world, &issues, &effective, now);
@@ -496,6 +515,20 @@ pub async fn tick_once(
         }
     }
 
+    // 6b. 冷却折进世界：`exec` 的失败回滚交回的 [`exec::Cooldown`] 是**本 tick 的事实**，
+    //     事件面看不见它，所以在这里按 effective `RetryBackoff` 换成截止时刻写进
+    //     `backoff_until`（换算是 `recon` 那一处）；下一个 tick 的 decide 因此看得到它，
+    //     这张票在冷却到期前不会被重新抢 / 重新派发（ticket #4：「非 service_unavailable
+    //     失败 ⇒ release + 记冷却」）。
+    for outcome in &outcomes {
+        if let Some(cooldown) = cooldown_of(outcome) {
+            world.backoff_until.insert(
+                cooldown.ticket_id.clone(),
+                recon::cooldown_deadline(now, cooldown.delay_ms),
+            );
+        }
+    }
+
     tracing::debug!(
         tick,
         source = ?effective.source,
@@ -509,6 +542,28 @@ pub async fn tick_once(
         source: effective.source,
         decisions,
         outcomes,
+    }
+}
+
+/// 一条执行结局里带的冷却登记（没有冷却的结局返回 `None`）。
+///
+/// 冷却只出现在两个地方：`exec` 的失败回滚（[`Outcome::Abandoned`] / [`Outcome::HardFailure`]
+/// 的 `rollback.cooldown`）与交还硬失败（[`ReleaseStep::Failed`] 的 `cooldown`）。
+fn cooldown_of(outcome: &TickOutcome) -> Option<&exec::Cooldown> {
+    match outcome {
+        TickOutcome::Claimed { .. } | TickOutcome::ClaimRefused { .. } => None,
+        TickOutcome::Dispatch { outcome, .. } => match outcome {
+            Outcome::Abandoned { rollback, .. } | Outcome::HardFailure { rollback, .. } => {
+                Some(&rollback.cooldown)
+            }
+            Outcome::Dispatched { .. } | Outcome::Retried { .. } | Outcome::LayoutUnderivable => {
+                None
+            }
+        },
+        TickOutcome::Release { step, .. } => match step {
+            ReleaseStep::Failed { cooldown, .. } => Some(cooldown),
+            ReleaseStep::Released { .. } | ReleaseStep::Retried { .. } => None,
+        },
     }
 }
 

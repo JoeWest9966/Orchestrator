@@ -44,8 +44,8 @@ fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("response serializes")
 }
 
-/// 假宿主的一条读数：`(方法, 路径不含查询串) → 响应体`。
-type Routes = BTreeMap<String, String>;
+/// 假宿主的一条读数：`(方法, 路径不含查询串) → (HTTP 状态码, 响应体)`。
+type Routes = BTreeMap<String, (u16, String)>;
 
 struct StubHost {
     addr: SocketAddr,
@@ -88,8 +88,8 @@ impl StubHost {
                         .get(&format!("{method} {path}"))
                         .cloned();
                     let response = match body {
-                        Some(body) => format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                        Some((status, body)) => format!(
+                            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         ),
@@ -122,7 +122,18 @@ impl StubHost {
         self.routes
             .lock()
             .unwrap()
-            .insert(format!("{method} {path}"), json(body));
+            .insert(format!("{method} {path}"), (200, json(body)));
+    }
+
+    /// 一条**失败**读数：闭集错误码的 HTTP 状态码 + 契约错误信封。
+    fn set_error(&self, method: &str, path: &str, code: ErrorCode) {
+        self.routes.lock().unwrap().insert(
+            format!("{method} {path}"),
+            (
+                code.http_status(),
+                ContractError::new(code, "scripted failure").to_json(),
+            ),
+        );
     }
 
     fn request_log(&self) -> Vec<String> {
@@ -641,6 +652,108 @@ async fn the_next_tick_dispatches_the_ticket_i_hold_and_then_releases_the_merged
             },
         }]
     );
+}
+
+#[tokio::test]
+async fn a_failed_dispatch_puts_the_ticket_in_cooldown_so_the_next_tick_does_not_redispatch_it() {
+    // 票 #4 的「dispatch 非 service_unavailable 失败 ⇒ release + 记冷却」。这次失败在事件面
+    // **没有任何事件**（宿主不会为一次没起来的 dispatch 发事件），所以冷却只能由 tick 自己
+    // 折进世界；否则这张票每个 tick 都会被重新抢 + 重新派发，永远不停。
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        issues(Some(ASSIGNEE), IssueState::Claimed),
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+    // 派发本身失败：`invalid_request`（只可能是我们自己编错了请求 ⇒ 放弃 + 交还 + 记冷却）。
+    host.set_error(
+        "POST",
+        &contract_path(ServiceName::AgentRunner, "/dispatches"),
+        ErrorCode::InvalidRequest,
+    );
+    let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
+    let ledger = Mutex::new(EventLedger::default());
+    let mut world = WorldModel::default();
+    let config = test_config(host.addr);
+
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+    assert!(
+        matches!(
+            report.outcomes.as_slice(),
+            [TickOutcome::Dispatch {
+                outcome: Outcome::Abandoned {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }]
+        ),
+        "派发失败的分支：{:?}",
+        report.outcomes
+    );
+    assert_eq!(
+        world.backoff_until.get(TICKET).map(String::as_str),
+        Some("2026-01-01T00:00:01Z"),
+        "冷却截止时刻 = 失败时刻 + effective retry_backoff.base_delay_ms（1000ms）"
+    );
+
+    // 下一个 tick（同一秒里，tick 间隔 50ms）：冷却未过 ⇒ 不重派、也不重抢。
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:00Z",
+        2,
+    )
+    .await;
+    assert!(
+        report.decisions.is_empty(),
+        "冷却中的票本 tick 不碰：{:?}",
+        report.decisions
+    );
+    assert_eq!(
+        dispatched_count(&host),
+        1,
+        "冷却期里没有第二次派发（这正是修之前每 tick 重派的那个洞）"
+    );
+
+    // 冷却过去之后（`now` 越过截止时刻）：重新派的——崩溃重启的续跑走的正是这条路。
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:02Z",
+        3,
+    )
+    .await;
+    assert!(
+        matches!(report.decisions.as_slice(), [Decision::Dispatch { .. }]),
+        "冷却到期后重新派：{:?}",
+        report.decisions
+    );
+    assert_eq!(dispatched_count(&host), 2);
+}
+
+/// 假宿主上收到过几次 dispatch 契约调用。
+fn dispatched_count(host: &StubHost) -> usize {
+    host.counts()
+        .get(&format!(
+            "POST {}",
+            contract_path(ServiceName::AgentRunner, "/dispatches")
+        ))
+        .copied()
+        .unwrap_or(0)
 }
 
 #[tokio::test]

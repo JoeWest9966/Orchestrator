@@ -308,6 +308,7 @@ fn happy_path_responses(attempt_id: &str) -> Vec<Canned> {
 async fn capture_alerts<T>(
     body: impl std::future::Future<Output = T>,
 ) -> (T, Vec<(String, String)>) {
+    crate::test_support::install_global_noop_subscriber();
     let log = WarningLog::default();
     let subscriber = tracing_subscriber::registry().with(log.clone());
     let guard = tracing::subscriber::set_default(subscriber);

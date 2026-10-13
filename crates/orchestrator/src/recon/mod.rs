@@ -433,6 +433,7 @@ mod tests {
 
     /// 在收集告警的 subscriber 下跑一段代码，返回收集到的 `(alert, tickets)`。
     fn capture_warnings(body: impl FnOnce()) -> Vec<(String, String)> {
+        crate::test_support::install_global_noop_subscriber();
         let log = WarningLog::default();
         let subscriber = tracing_subscriber::registry().with(log.clone());
         tracing::subscriber::with_default(subscriber, body);

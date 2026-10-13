@@ -1103,6 +1103,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AlertLog {
 async fn tick_with_alerts(host: &StubHost, now: &str) -> (TickReport, Vec<String>) {
     let log = AlertLog::default();
     let subscriber = tracing_subscriber::registry().with(log.clone());
+    crate::test_support::install_global_noop_subscriber();
     let _guard = tracing::subscriber::set_default(subscriber);
     let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
     let ledger = Mutex::new(EventLedger::default());

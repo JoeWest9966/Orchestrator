@@ -5,3 +5,6 @@ pub mod exec;
 pub mod main_loop;
 pub mod recon;
 pub mod tick;
+
+#[cfg(test)]
+mod test_support;

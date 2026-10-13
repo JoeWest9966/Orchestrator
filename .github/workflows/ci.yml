@@ -39,10 +39,16 @@ jobs:
             grep -F 'rev=ec5fd3a869147d28366f74dbd07ed869574be914'
 
       # §4.2：契约主版本被钉住——编译期常量 1 + 运行时握手核对该主版本。
+      # 不用 `--exact`：完整测试路径一旦改动，`--exact` 会静默选中 0 个测试
+      # （exit 0），断言形同虚设。这里用子串匹配，并硬性要求它真的选中了测试。
       - name: Assert the pinned contract major
         run: |
-          CARGO_TARGET_DIR="$PWD/target" cargo test --locked -p orchestrator \
-            --lib -- contract_major --exact
+          log=$(CARGO_TARGET_DIR="$PWD/target" cargo test --locked -p orchestrator --lib -- contract_major 2>&1)
+          printf '%s\n' "$log"
+          if printf '%s\n' "$log" | grep -q 'running 0 tests'; then
+            echo "FAIL: the pinned-major assertion selected no test — it is vacuous"
+            exit 1
+          fi
 
       - name: Build
         run: CARGO_TARGET_DIR="$PWD/target" cargo build --locked --all-targets

@@ -397,9 +397,14 @@ async fn a_sigkill_then_a_restart_does_not_dispatch_twice() {
     // 重启：同一个宿主、同一份事件账、同一张被 claim 的票。
     let mut second = OrchestratorRun::spawn(&env, scratch.path().join("orchestrator-2.log"));
     // 等足够多的 tick（重启后的对账重建到「看到活跃 attempt」之间也要几个 tick）。
-    // 等足够多的 tick（重启后的对账重建到「看到活跃 attempt」之间也要几个 tick）。
     let ticked = poll(Duration::from_secs(30), || async {
-        (second.log().lines().filter(|line| is_tick_line(line)).count() >= 5).then_some(())
+        (second
+            .log()
+            .lines()
+            .filter(|line| is_tick_line(line))
+            .count()
+            >= 5)
+            .then_some(())
     })
     .await;
     checks.record(
@@ -407,7 +412,11 @@ async fn a_sigkill_then_a_restart_does_not_dispatch_twice() {
         ticked.is_some(),
         format!(
             "{} tick line(s), {} log bytes",
-            second.log().lines().filter(|line| is_tick_line(line)).count(),
+            second
+                .log()
+                .lines()
+                .filter(|line| is_tick_line(line))
+                .count(),
             second.log().len()
         ),
     );

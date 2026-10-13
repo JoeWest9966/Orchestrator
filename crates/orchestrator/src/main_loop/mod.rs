@@ -204,11 +204,13 @@ impl OrchestratorConfig {
     /// 从一个查名函数装载（单测用它，避免动进程级的 env）。
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let host = required(&lookup, ENV_HOST)?;
-        let host = host.parse::<SocketAddr>().map_err(|_| ConfigError::Invalid {
-            var: ENV_HOST,
-            value: host.clone(),
-            expected: "a host:port socket address",
-        })?;
+        let host = host
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::Invalid {
+                var: ENV_HOST,
+                value: host.clone(),
+                expected: "a host:port socket address",
+            })?;
         let raw_interval = required(&lookup, ENV_TICK_INTERVAL_MS)?;
         let tick_interval_ms = raw_interval
             .parse::<u64>()
@@ -315,7 +317,10 @@ pub enum TickOutcome {
     /// `Decision::Dispatch` 的派发序列结局（`exec` 的闭集原样带出）。
     Dispatch { ticket_id: String, outcome: Outcome },
     /// `Decision::Release` 的结局（`exec` 的闭集原样带出）。
-    Release { ticket_id: String, step: ReleaseStep },
+    Release {
+        ticket_id: String,
+        step: ReleaseStep,
+    },
 }
 
 /// 一次 tick 的可观察结果。
@@ -439,22 +444,23 @@ pub async fn tick_once(
     if let Some(workflow) = effective.effective.clone() {
         for decision in &decisions {
             let outcome = match decision {
-                Decision::Claim { ticket_id } => match client.claim(ticket_id, &config.assignee).await
-                {
-                    Ok(response) if response.claimed => TickOutcome::Claimed {
-                        ticket_id: ticket_id.clone(),
-                    },
-                    // 2xx 但 `claimed == false`：`ClaimResponse` 的契约注释说这就是「已被他人
-                    // 持有」的语义（调用方本会收到 `conflict`）。与 `exec` 的同一处映射同款。
-                    Ok(_) => TickOutcome::ClaimRefused {
-                        ticket_id: ticket_id.clone(),
-                        code: ErrorCode::Conflict,
-                    },
-                    Err(error) => TickOutcome::ClaimRefused {
-                        ticket_id: ticket_id.clone(),
-                        code: error.code,
-                    },
-                },
+                Decision::Claim { ticket_id } => {
+                    match client.claim(ticket_id, &config.assignee).await {
+                        Ok(response) if response.claimed => TickOutcome::Claimed {
+                            ticket_id: ticket_id.clone(),
+                        },
+                        // 2xx 但 `claimed == false`：`ClaimResponse` 的契约注释说这就是「已被他人
+                        // 持有」的语义（调用方本会收到 `conflict`）。与 `exec` 的同一处映射同款。
+                        Ok(_) => TickOutcome::ClaimRefused {
+                            ticket_id: ticket_id.clone(),
+                            code: ErrorCode::Conflict,
+                        },
+                        Err(error) => TickOutcome::ClaimRefused {
+                            ticket_id: ticket_id.clone(),
+                            code: error.code,
+                        },
+                    }
+                }
                 Decision::Dispatch { ticket_id } => {
                     let layout = config.layout.layout_for(ticket_id);
                     TickOutcome::Dispatch {
@@ -471,7 +477,8 @@ pub async fn tick_once(
                 }
                 Decision::Release { ticket_id } => TickOutcome::Release {
                     ticket_id: ticket_id.clone(),
-                    step: exec::release_ticket(client, &config.assignee, ticket_id, &workflow).await,
+                    step: exec::release_ticket(client, &config.assignee, ticket_id, &workflow)
+                        .await,
                 },
             };
             tracing::debug!(

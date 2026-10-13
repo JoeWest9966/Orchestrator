@@ -233,7 +233,10 @@ pub async fn dispatch_ticket(
         issue_id: ticket_id.to_string(),
         // 内容物装配标识没有来源（票面与契约都没给）⇒ 不发明，恒 `None`。
         profile: None,
-        prompt: Some(expand_ticket_placeholder(&workflow.prompt_template, ticket_id)),
+        prompt: Some(expand_ticket_placeholder(
+            &workflow.prompt_template,
+            ticket_id,
+        )),
     };
     match client.dispatch(&request).await {
         Ok(response) => Outcome::Dispatched {

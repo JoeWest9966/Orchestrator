@@ -18,9 +18,7 @@ use farm_sdk::services::tracker::{
 use farm_sdk::services::workspace::{
     MappingListResponse, WorkspaceMapping, WorktreeRef, WorktreeState,
 };
-use farm_sdk::workflow::{
-    EffectiveSource, RetryBackoff, WorkflowConfig, WorkflowConfigStatus,
-};
+use farm_sdk::workflow::{EffectiveSource, RetryBackoff, WorkflowConfig, WorkflowConfigStatus};
 use farm_sdk::{contract_path, routes, ServiceName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -73,12 +71,17 @@ impl StubHost {
                 tokio::spawn(async move {
                     let (method, path, _) = read_request(&mut socket).await;
                     // WS upgrade 不在这台假宿主上：关掉连接，`main_loop` 的订阅任务会告警并重连。
-                    if !path.starts_with("/v1/") && !path.starts_with("/admin/") && path != "/handshake"
+                    if !path.starts_with("/v1/")
+                        && !path.starts_with("/admin/")
+                        && path != "/handshake"
                     {
                         let _ = socket.shutdown().await;
                         return;
                     }
-                    recorded.lock().unwrap().push((method.clone(), path.clone()));
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone()));
                     let body = served
                         .lock()
                         .unwrap()
@@ -176,7 +179,10 @@ async fn read_request(socket: &mut TcpStream) -> (String, String, String) {
 // 契约面的夹具读数
 // ---------------------------------------------------------------------------
 
-fn config(status_effective: Option<WorkflowConfig>, source: Option<EffectiveSource>) -> WorkflowConfigStatus {
+fn config(
+    status_effective: Option<WorkflowConfig>,
+    source: Option<EffectiveSource>,
+) -> WorkflowConfigStatus {
     WorkflowConfigStatus {
         repo_id: REPO.to_string(),
         effective: status_effective,
@@ -401,10 +407,8 @@ fn every_required_variable_is_named_when_it_is_missing_and_there_is_no_default()
         ENV_WORKTREE_BRANCH,
     ] {
         let env = all_eight();
-        let env: HashMap<String, String> = env
-            .into_iter()
-            .filter(|(key, _)| key != missing)
-            .collect();
+        let env: HashMap<String, String> =
+            env.into_iter().filter(|(key, _)| key != missing).collect();
         let error = OrchestratorConfig::from_lookup(|name| env.get(name).cloned())
             .expect_err("must refuse to run half-configured");
         assert_eq!(error, ConfigError::Missing(missing));
@@ -497,7 +501,10 @@ async fn a_tick_reads_mappings_config_issues_and_the_event_increment_in_that_ord
         host.request_log(),
         vec![
             format!("GET {}", contract_path(ServiceName::Workspace, "/mappings")),
-            format!("GET {}", routes::admin_path(&format!("/workflow/config/{REPO}"))),
+            format!(
+                "GET {}",
+                routes::admin_path(&format!("/workflow/config/{REPO}"))
+            ),
             format!("GET {}", contract_path(ServiceName::Tracker, "/issues")),
             format!("GET {}", contract_path(ServiceName::Events, "/history")),
             format!("POST {}", contract_path(ServiceName::Tracker, "/claims")),
@@ -672,7 +679,11 @@ async fn a_tick_that_cannot_pin_the_repo_id_stays_idle_and_does_not_invent_a_con
     )
     .await;
 
-    assert_eq!(report, TickReport::default(), "推不出 repo_id ⇒ 本 tick idle");
+    assert_eq!(
+        report,
+        TickReport::default(),
+        "推不出 repo_id ⇒ 本 tick idle"
+    );
     assert_eq!(host.request_log().len(), 1, "只读了那一次 mappings");
 }
 
@@ -725,7 +736,9 @@ struct StubWs {
 
 impl StubWs {
     async fn spawn(frames: Vec<Vec<u8>>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub ws");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub ws");
         let addr = listener.local_addr().expect("stub ws addr");
         tokio::spawn(async move {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -800,8 +813,13 @@ async fn a_masked_frame_is_refused_instead_of_guessed() {
     // RFC 6455 §5.1：服务端帧不带掩码。带掩码的帧（不合规）不猜长度，直接报错。
     let masked = vec![0x81u8, 0x80, 0, 0, 0, 0];
     let ws = StubWs::spawn(vec![masked]).await;
-    let mut stream = EventStream::connect(ws.addr, "op-token").await.expect("upgrade");
-    let error = stream.hello().await.expect_err("must refuse a masked frame");
+    let mut stream = EventStream::connect(ws.addr, "op-token")
+        .await
+        .expect("upgrade");
+    let error = stream
+        .hello()
+        .await
+        .expect_err("must refuse a masked frame");
     assert!(error.to_string().contains("masked"), "{error}");
 }
 
@@ -809,23 +827,14 @@ async fn a_masked_frame_is_refused_instead_of_guessed() {
 async fn the_ws_task_only_books_events_and_never_touches_the_decision_path() {
     let first = merge_event();
     let hello = WsHello::new(farm_sdk::CONTRACT_VERSION, vec![EventKind::Merge]);
-    let ws = StubWs::spawn(vec![
-        text_frame(&json(&hello)),
-        text_frame(&json(&first)),
-    ])
-    .await;
+    let ws = StubWs::spawn(vec![text_frame(&json(&hello)), text_frame(&json(&first))]).await;
 
     let ledger = Mutex::new(EventLedger::default());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut shutdown_rx = shutdown_rx;
-    subscribe(
-        ws.addr,
-        "op-token",
-        &ledger,
-        &mut shutdown_rx,
-    )
-    .await
-    .expect("订阅正常收尾（对端关闭）");
+    subscribe(ws.addr, "op-token", &ledger, &mut shutdown_rx)
+        .await
+        .expect("订阅正常收尾（对端关闭）");
 
     assert_eq!(ledger.lock().unwrap().len(), 1);
     assert_eq!(
@@ -917,7 +926,10 @@ async fn effective_none_is_idle_with_an_alert_and_no_invented_default_config() {
     );
     let counts = host.counts();
     assert_eq!(
-        counts.get(&format!("POST {}", contract_path(ServiceName::Tracker, "/claims"))),
+        counts.get(&format!(
+            "POST {}",
+            contract_path(ServiceName::Tracker, "/claims")
+        )),
         None,
         "idle ⇒ 一张票也不抢"
     );
@@ -978,7 +990,10 @@ async fn a_last_known_good_config_orchestrates_normally_and_is_annotated_every_t
     );
     assert_eq!(
         host.counts()
-            .get(&format!("POST {}", contract_path(ServiceName::Tracker, "/claims")))
+            .get(&format!(
+                "POST {}",
+                contract_path(ServiceName::Tracker, "/claims")
+            ))
             .copied(),
         Some(1),
         "标注不妨碍编排：claim 照发"

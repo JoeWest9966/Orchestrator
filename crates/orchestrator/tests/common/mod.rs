@@ -8,6 +8,11 @@
 //!
 //! 编排器**只**需要宿主与 agent 替身：宿主自己按 env 装配替身，编排器不感知 agent 跑在哪
 //! （ADR-0001 决策 4 / ADR-0006），也不发通知（通知是宿主的活）。
+//!
+//! 这个文件被**每个**集成测试目标各编一次（各目标自己 `mod common;`），帮手按目标取用：
+//! 对 `dispatch_sequence` 来说，主循环 e2e 专用的那几个当然「未使用」。`dead_code` 的前提
+//! 在这里不成立（它们都被 `tests/main_loop_e2e.rs` 用着），故整模块关掉这条噪声。
+#![allow(dead_code)]
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -63,7 +68,8 @@ async fn wait_listening(addr: SocketAddr, timeout: Duration) -> bool {
 /// 一个被测的真实 farm-host 进程 + 它的临时目录（Drop 时一起收尾）。
 pub struct TestHost {
     child: Child,
-    addr: SocketAddr,
+    /// 宿主的回环地址：测试要拿它当 `FARM_HOST` 喂给编排器、并按契约直接打宿主。
+    pub addr: SocketAddr,
     op_token: String,
     admin_token: String,
     _dir: tempfile::TempDir,
@@ -167,5 +173,185 @@ impl Checks {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 编排器进程夹具（ticket #5 的 e2e：真宿主 + **真编排器二进制** + fake-pi）
+// ---------------------------------------------------------------------------
+
+/// 定位被测的编排器二进制。
+///
+/// Cargo 为同包集成测试注入 `CARGO_BIN_EXE_<name>`——它**总是**存在（`cargo test` 会先编
+/// 二进制），所以这一条不会静默 skip。其余二进制走 `*_BIN` / `CARGO_TARGET_DIR`（骨架的
+/// 优先序），找不到就由调用方跳过（`60-environment-and-risks.md` R5）。
+pub fn orchestrator_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_orchestrator"))
+}
+
+/// 编排器子进程的 env（票 #5 的闭集五 + worktree 三条 `[UNSOURCED]` 扩展，见 `main_loop`）。
+pub struct OrchestratorEnv {
+    pub host: SocketAddr,
+    pub token: String,
+    pub admin_token: String,
+    pub assignee: String,
+    pub tick_interval_ms: u64,
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub worktree_branch: String,
+}
+
+impl OrchestratorEnv {
+    /// 一组 env（worktree 路径 / 分支是**模板**：每张票展开成自己的那条）。
+    pub fn new(host: SocketAddr, repo_path: &str, worktrees_root: &std::path::Path) -> Self {
+        Self {
+            host,
+            token: "e2e-op-token".to_string(),
+            admin_token: "e2e-admin-token".to_string(),
+            assignee: "orchestrator-e2e".to_string(),
+            tick_interval_ms: 50,
+            repo_path: repo_path.to_string(),
+            worktree_path: worktrees_root
+                .join("{{ticket_id}}")
+                .to_string_lossy()
+                .into_owned(),
+            worktree_branch: "farm/{{ticket_id}}".to_string(),
+        }
+    }
+}
+
+/// 一个被测的**真编排器进程**：日志落文件（断言 LKG 标注 / tick 活性），可被 `SIGKILL`。
+pub struct OrchestratorRun {
+    child: Child,
+    log_path: PathBuf,
+}
+
+impl OrchestratorRun {
+    /// spawn 编排器：日志（stdout + stderr）落 `log_path`，级别 `debug`（tick 行也要）。
+    pub fn spawn(env: &OrchestratorEnv, log_path: PathBuf) -> Self {
+        let bin = orchestrator_bin();
+        let log = std::fs::File::create(&log_path).expect("create orchestrator log");
+        let child = Command::new(&bin)
+            .env("FARM_HOST", env.host.to_string())
+            .env("FARM_TOKEN", &env.token)
+            .env("FARM_ADMIN_TOKEN", &env.admin_token)
+            .env("FARM_ASSIGNEE", &env.assignee)
+            .env("TICK_INTERVAL_MS", env.tick_interval_ms.to_string())
+            .env("FARM_REPO_PATH", &env.repo_path)
+            .env("FARM_WORKTREE_PATH", &env.worktree_path)
+            .env("FARM_WORKTREE_BRANCH", &env.worktree_branch)
+            .env("RUST_LOG", "debug")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(
+                log.try_clone().expect("clone log"),
+            ))
+            .stderr(std::process::Stdio::from(log))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
+        Self { child, log_path }
+    }
+
+    /// `SIGKILL`（`Child::kill` 在 Unix 上就是 `kill -9`）：模拟编排器被硬杀。
+    pub fn sigkill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// 进程还在跑吗（`Ok(None)` = 还在）。
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// 到目前为止的日志全文（可能还没有内容：进程刚起）。
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+}
+
+impl Drop for OrchestratorRun {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试侧以自己的身份打契约（**扮演 agent**，不是编排器的能力）
+// ---------------------------------------------------------------------------
+
+/// 测试扮演 agent 提交 merge 提议：`POST /v1/merge/proposals`。
+///
+/// 这条路由**不在编排器的范围里**（提议是 agent 的活，`farm-host/src/merge.rs`：agent 只能
+/// 提议、宿主机械校验后执行）。所以它不进 `ContractClient`——测试自己用契约类型 + 契约 HTTP
+/// 机器打，零手写 wire 名（路径来自 `farm_sdk::contract_path`，token header 来自 `AuthScheme`）。
+pub async fn propose_merge(
+    addr: SocketAddr,
+    token: &str,
+    proposal: &farm_sdk::services::merge::MergeProposal,
+) -> Result<farm_sdk::services::merge::MergeProposalResponse, String> {
+    use farm_sdk::handshake::AuthScheme;
+    use farm_sdk::{contract_path, ServiceName};
+    let body = serde_json::to_string(proposal).map_err(|e| e.to_string())?;
+    let auth = AuthScheme::default();
+    let (status, text) = orchestrator::contract::http::http_request(
+        addr,
+        "POST",
+        &contract_path(ServiceName::Merge, "/proposals"),
+        Some((auth.http_header.as_str(), token)),
+        Some(&body),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))
+}
+
+// ---------------------------------------------------------------------------
+// 轮询（用**截止时刻**，不用固定 sleep：`60-environment-and-risks.md` R11）
+// ---------------------------------------------------------------------------
+
+/// 反复探测直到有值或超时。探测闭包里的 await 借的是闭包外的作用域（不会借闭包本身）。
+pub async fn poll<T, Fut, F>(timeout: Duration, mut probe: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe().await {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 事件历史里某张票的某种事件（观测一律走契约面的事件账）。
+pub async fn events_of_kind(
+    client: &ContractClient,
+    ticket_id: &str,
+    kind: farm_sdk::events::EventKind,
+) -> Vec<farm_sdk::events::EventEnvelope> {
+    match client
+        .event_history(&farm_sdk::services::events::EventHistoryQuery {
+            ticket_id: Some(ticket_id.to_string()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(history) => history
+            .events
+            .into_iter()
+            .filter(|event| event.kind == kind)
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }

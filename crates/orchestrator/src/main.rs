@@ -66,14 +66,22 @@ async fn wait_for_signal() {
         let mut interrupt = match signal(SignalKind::interrupt()) {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::warn!(alert = "signal_unavailable", error = error.to_string().as_str(), "SIGINT 无法订阅");
+                tracing::warn!(
+                    alert = "signal_unavailable",
+                    error = error.to_string().as_str(),
+                    "SIGINT 无法订阅"
+                );
                 return;
             }
         };
         let mut terminate = match signal(SignalKind::terminate()) {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::warn!(alert = "signal_unavailable", error = error.to_string().as_str(), "SIGTERM 无法订阅");
+                tracing::warn!(
+                    alert = "signal_unavailable",
+                    error = error.to_string().as_str(),
+                    "SIGTERM 无法订阅"
+                );
                 return;
             }
         };

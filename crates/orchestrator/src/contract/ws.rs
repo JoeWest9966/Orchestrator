@@ -103,13 +103,13 @@ impl EventStream {
             match opcode {
                 0x0 | 0x2 => {
                     return Err(std::io::Error::other(format!(
-                        "unsupported ws data frame (opcode {opcode:#x}, fin {fin}) on the event stream"
-                    )))
+                    "unsupported ws data frame (opcode {opcode:#x}, fin {fin}) on the event stream"
+                )))
                 }
                 0x1 => {
-                    return String::from_utf8(payload)
-                        .map(Some)
-                        .map_err(|e| std::io::Error::other(format!("ws text frame is not utf-8: {e}")))
+                    return String::from_utf8(payload).map(Some).map_err(|e| {
+                        std::io::Error::other(format!("ws text frame is not utf-8: {e}"))
+                    })
                 }
                 0x8 => return Ok(None), // close
                 0x9 | 0xA => continue,  // ping / pong：由 axum 侧处理，这里跳过

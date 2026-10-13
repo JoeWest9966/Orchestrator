@@ -99,6 +99,16 @@ fn passing_test_script(dir: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// 一条 tick 汇总行。
+///
+/// 为什么不数 `tick=`：`tracing` 的默认 fmt 会给**字段名与 `=`** 上色（实际字节是
+/// `\x1b[3mtick\x1b[0m\x1b[2m=\x1b[0m`），所以 `tick=` 这个字面量在日志里**不存在**
+/// （探针实证）。可靠可读的部分是**消息**（纯文本）与字段名文本：每 tick 的汇总行是
+/// `... : tick tick=<n> source=... decisions=<n> ...`，其中 `decisions` 只在这一行上出现。
+fn is_tick_line(line: &str) -> bool {
+    line.contains(" tick ") && line.contains("decisions")
+}
+
 fn missing_binaries() -> bool {
     if host_bin().is_none() || fake_pi_bin().is_none() {
         eprintln!(
@@ -387,14 +397,19 @@ async fn a_sigkill_then_a_restart_does_not_dispatch_twice() {
     // 重启：同一个宿主、同一份事件账、同一张被 claim 的票。
     let mut second = OrchestratorRun::spawn(&env, scratch.path().join("orchestrator-2.log"));
     // 等足够多的 tick（重启后的对账重建到「看到活跃 attempt」之间也要几个 tick）。
+    // 等足够多的 tick（重启后的对账重建到「看到活跃 attempt」之间也要几个 tick）。
     let ticked = poll(Duration::from_secs(30), || async {
-        (second.log().matches("tick=").count() >= 5).then_some(())
+        (second.log().lines().filter(|line| is_tick_line(line)).count() >= 5).then_some(())
     })
     .await;
     checks.record(
         "the restarted orchestrator is really ticking (its own log says so)",
         ticked.is_some(),
-        format!("{} log bytes", second.log().len()),
+        format!(
+            "{} tick line(s), {} log bytes",
+            second.log().lines().filter(|line| is_tick_line(line)).count(),
+            second.log().len()
+        ),
     );
 
     // 无双派：两个进程的生命期里，那张票仍然只有**一条** dispatch 事件。

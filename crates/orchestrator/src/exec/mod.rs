@@ -233,7 +233,10 @@ pub async fn dispatch_ticket(
         issue_id: ticket_id.to_string(),
         // 内容物装配标识没有来源（票面与契约都没给）⇒ 不发明，恒 `None`。
         profile: None,
-        prompt: Some(expand_prompt(&workflow.prompt_template, ticket_id)),
+        prompt: Some(expand_ticket_placeholder(
+            &workflow.prompt_template,
+            ticket_id,
+        )),
     };
     match client.dispatch(&request).await {
         Ok(response) => Outcome::Dispatched {
@@ -369,8 +372,13 @@ fn cooldown_for(workflow: &WorkflowConfig, ticket_id: &str) -> Cooldown {
     }
 }
 
-/// `prompt_template` 的占位符展开：只替换票面命名的 `{{ticket_id}}`。
-fn expand_prompt(template: &str, ticket_id: &str) -> String {
+/// `{{ticket_id}}` 占位符展开：只替换票面命名的这一个占位符，未识别的 `{{...}}` 原样留着。
+///
+/// 两处调用共用同一个展开器：`prompt_template`（本模块）与 worktree 路径 / 分支模板
+/// （`crate::main_loop` 的 `FARM_WORKTREE_PATH` / `FARM_WORKTREE_BRANCH`——那两条是票面
+/// env 闭集之外的扩展，见 `main_loop` 模块头的 `[UNSOURCED]`）。它们借用的是契约
+/// `WorkflowConfig::prompt_template` 已经文档化的**同一个**占位符机制，不是新发明。
+pub fn expand_ticket_placeholder(template: &str, ticket_id: &str) -> String {
     template.replace(TICKET_ID_PLACEHOLDER, ticket_id)
 }
 

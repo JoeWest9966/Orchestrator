@@ -330,7 +330,10 @@ fn parse_host_timestamp(text: &str) -> Option<i64> {
 }
 
 /// Unix 秒 → 宿主事件时间戳形状。
-fn format_host_timestamp(epoch_secs: i64) -> String {
+///
+/// `pub(crate)`：tick 循环（`crate::main_loop`）注入的钟面必须与本模块产出的时间戳同形，
+/// 形状的日历换算只有这一处实现（「字典序即时间序」的前提只有一处需要成立）。
+pub(crate) fn format_host_timestamp(epoch_secs: i64) -> String {
     let days = epoch_secs.div_euclid(86_400);
     let tod = epoch_secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);

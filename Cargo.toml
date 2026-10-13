@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/orchestrator"]
+
+# 单 crate 起步（#6 范围："建 `crates/orchestrator` workspace（单 crate 起步，模块 `contract/`）"）。
+# 未来若拆 crate，只需往 members 里加。
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/JoeWest9966/Orchestrator"
+
+[workspace.dependencies]
+# --- 契约类型单一源（ADR-0003）：git + 完整 40 位 rev，禁止 path/branch ---
+farm-sdk = { git = "https://github.com/JoeWest9966/Farm.git", rev = "ec5fd3a869147d28366f74dbd07ed869574be914" }
+
+# --- 运行时（farm-sdk 不带 tokio，编排器必须自备） ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+
+# --- 序列化（与 farm-sdk 同代；契约类型自带 derive） ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- 日志（可选，见 §3） ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- 开发期 ---
+tempfile = "3"

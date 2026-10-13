@@ -1,0 +1,24 @@
+[package]
+name = "orchestrator"
+description = "Orchestrator v1：Farm 契约的确定性客户端，跑 reconcile → decide → execute 的 tick 循环。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+farm-sdk.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile.workspace = true

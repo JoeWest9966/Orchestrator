@@ -1,4 +1,4 @@
-//! exec —— 派发序列执行器（spec §5.3 派发序列 / §5.4 回收接线）。
+//! exec —— 派发序列（spec §5.3 派发序列 / §5.4 回收接线）。
 //!
 //! 本模块把 decide 定下的 `Decision::Dispatch`（`crate::tick`）展开成契约调用序列，并且只为
 //! 这一张票做两件事：**派发**与**失败回滚**。交还一张已完成的票（spec §5.4「`merge` ⇒
@@ -56,15 +56,17 @@
 //! * 回收后仍在我名下、未完成、冷却已过 ⇒ decide 发 `Decision::Dispatch` ⇒ [`dispatch_ticket`]；
 //! * 回收后已完成（`merge` / 完成信号）⇒ decide 发 `Decision::Release` ⇒ [`release_ticket`]：
 //!   一条 release 契约调用，**别的什么都不做**。关票 / 开 PR / 评论 / 打标签是宿主的机械投影
-//!   （宿主按 workflow 配置自己执行），执行器连配置里那组开关都不读；
+//!   （宿主按 workflow 配置自己执行），本模块连配置里那组开关都不读；
 //! * `blocked` / `needs_attention` 不结束 attempt，世界里的活跃 attempt 还在 ⇒ 决策面表现为
-//!   「票还在活跃集里」⇒ 执行器零动作、零冷却：登记是 `recon` 的活。
+//!   「票还在活跃集里」⇒ 零动作、零冷却：登记是 `recon` 的活。
 //!
 //! 交还本身也没有补偿动作：`ReleaseOutcome::NotClaimed`（无人持有）是幂等空操作，不是错误。
 
 use farm_sdk::services::agent_runner::DispatchRequest;
-use farm_sdk::services::tracker::ReleaseOutcome;
-use farm_sdk::services::workspace::{MappingListResponse, WorktreeEstablishRequest};
+use farm_sdk::services::tracker::{ClaimResponse, ReleaseOutcome};
+use farm_sdk::services::workspace::{
+    MappingListResponse, WorkspaceMapping, WorktreeEstablishRequest,
+};
 use farm_sdk::workflow::WorkflowConfig;
 use farm_sdk::ErrorCode;
 
@@ -110,13 +112,19 @@ pub enum Disposition {
     /// 放弃本票 + **交还**（我方 bug：请求不合法只可能是我们自己编错了）：告警一次，记冷却。
     AbandonedAndReleased,
     /// 硬失败：凭据 / 契约版本 / 路由方法 / 宿主实现面不可自愈。告警一次，交还尽力而为，记冷却；
-    /// 本 tick 余下的序列不该再发契约调用（这一处置是给 tick 循环的信号，执行器只报出来）。
+    /// 本 tick 余下的序列不该再发契约调用（这一处置是给 tick 循环的信号，本模块只报出来）。
     Fatal,
 }
 
 /// 十码穷举分流：每个码都有自己的分支（`match` 里逐码成臂，没有 `_`——新增码是契约变更，
-/// 编译器会在这里点出来）。判据只取枚举本身与 `is_retryable()`，不取 HTTP 状态码、不取字符串。
+/// 编译器会在这里点出来）。
+///
+/// 可重试性由 [`ErrorCode::is_retryable`] 单一源判定，不在这里硬编码哪个码可重试；
+/// 不可重试的码再逐码成臂。判据只取枚举本身，不取 HTTP 状态码、不取字符串。
 pub fn route(code: ErrorCode) -> Disposition {
+    if code.is_retryable() {
+        return Disposition::Retry;
+    }
     match code {
         ErrorCode::Unauthorized => Disposition::Fatal,
         ErrorCode::Forbidden => Disposition::Fatal,
@@ -126,7 +134,7 @@ pub fn route(code: ErrorCode) -> Disposition {
         ErrorCode::MethodNotAllowed => Disposition::Fatal,
         ErrorCode::Conflict => Disposition::AbandonedNotMine,
         ErrorCode::NotImplemented => Disposition::Fatal,
-        ErrorCode::ServiceUnavailable => Disposition::Retry,
+        ErrorCode::ServiceUnavailable => unreachable!("service_unavailable is retryable"),
         ErrorCode::Internal => Disposition::Fatal,
     }
 }
@@ -246,7 +254,7 @@ pub async fn dispatch_ticket(
     }
 }
 
-/// 交还一张票（spec §5.4：完成信号 ⇒ 移出活跃集）。执行器在这条路上只打这一条契约路由。
+/// 交还一张票（spec §5.4：完成信号 ⇒ 移出活跃集）。本模块在这条路上只打这一条契约路由。
 pub async fn release_ticket(
     client: &ContractClient,
     assignee: &str,
@@ -289,10 +297,11 @@ async fn claim_step(
     workflow: &WorkflowConfig,
 ) -> Option<Outcome> {
     match client.claim(ticket_id, assignee).await {
-        Ok(response) if response.claimed => None,
-        // 2xx 但 `claimed == false`：`ClaimResponse` 的契约注释说这就是「已被他人持有」的语义
-        // （调用方本会收到 `conflict`），所以走同一个分流分支。
-        Ok(_) => Some(roll_back(client, assignee, ticket_id, workflow, ErrorCode::Conflict).await),
+        // `claimed == false` 的解释（`interpret_claim`）只有一处：契约说这就是「已被他人持有」。
+        Ok(response) => match interpret_claim(&response) {
+            Ok(()) => None,
+            Err(code) => Some(roll_back(client, assignee, ticket_id, workflow, code).await),
+        },
         Err(error) => Some(roll_back(client, assignee, ticket_id, workflow, error.code).await),
     }
 }
@@ -389,37 +398,71 @@ pub fn expand_ticket_placeholder(template: &str, ticket_id: &str) -> String {
 /// 推不出就返回 `None`：mappings 里既没有本票的 worktree，也没有**唯一**一条
 /// `(spec_id, integration_branch)` 可当作本编排器的目标（空列表、或多条并存都算推不出）。
 /// 多条并存时没有任何契约字段能挑出「本编排器的那条」——不猜，交给人的裁决。
+/// `ClaimResponse` 的解释：拿到 ⇒ `Ok(())`；没拿到 ⇒ `Err(ErrorCode::Conflict)`。
+///
+/// `claimed == false` 在契约里的语义就是「已被他人持有」（`ClaimResponse` 的注释：调用方本会
+/// 收到 `conflict`）。这一个映射只有一处——本模块的 claim 步与主循环的 `Decision::Claim` 臂
+/// 都走它，不再各写一遍。
+pub fn interpret_claim(response: &ClaimResponse) -> Result<(), ErrorCode> {
+    if response.claimed {
+        Ok(())
+    } else {
+        Err(ErrorCode::Conflict)
+    }
+}
+
+/// 从 workspace 映射里挑出「本编排器的那一条」。
+///
+/// 判据（只有一个，两处调用方共用）：**先按票挑**——哪条映射的 worktrees 里命中 `owns` 就取它；
+/// 一条都没命中时，**只有恰好一条映射**才兜底用它；多条并存而无一命中 ⇒ `None`——没有任何契约
+/// 字段能指出「本编排器的那条」，不猜。
+///
+/// 主循环用它挑 `repo_id`（生效配置的键），本模块的 [`worktree_request`] 用它挑
+/// `(spec_id, integration_branch)`：同一条判据，不再有两份实现。
+pub fn select_mapping(
+    mappings: &MappingListResponse,
+    owns: impl Fn(&str) -> bool,
+) -> Option<&WorkspaceMapping> {
+    let hits: Vec<&WorkspaceMapping> = mappings
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            mapping
+                .worktrees
+                .iter()
+                .any(|worktree| owns(worktree.ticket_id.as_str()))
+        })
+        .collect();
+    match hits.as_slice() {
+        // 确定性：同一份读数下挑出的恒是同一条（映射顺序不保证，取 spec_id 字典序最小）。
+        [_, ..] => hits.into_iter().min_by(|a, b| a.spec_id.cmp(&b.spec_id)),
+        [] => match mappings.mappings.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        },
+    }
+}
+
 fn worktree_request(
     mappings: &MappingListResponse,
     ticket_id: &str,
     layout: &WorktreeLayout,
 ) -> Option<WorktreeEstablishRequest> {
-    let mapped = mappings.mappings.iter().find_map(|mapping| {
-        mapping
-            .worktrees
-            .iter()
-            .find(|worktree| worktree.ticket_id == ticket_id)
-            .map(|worktree| (mapping, worktree))
-    });
-    let (spec_id, integration_branch, worktree_path, worktree_branch) = match mapped {
-        Some((mapping, worktree)) => (
-            mapping.spec_id.clone(),
-            mapping.integration_branch.clone(),
-            worktree.path.clone(),
-            worktree.branch.clone(),
-        ),
-        None => {
-            let [mapping] = mappings.mappings.as_slice() else {
-                return None;
-            };
-            (
-                mapping.spec_id.clone(),
-                mapping.integration_branch.clone(),
-                layout.worktree_path.clone(),
-                layout.worktree_branch.clone(),
-            )
-        }
-    };
+    let mapping = select_mapping(mappings, |ticket| ticket == ticket_id)?;
+    let spec_id = mapping.spec_id.clone();
+    let integration_branch = mapping.integration_branch.clone();
+    // 本票已有 worktree ⇒ 路径与分支复用它（契约读数，不发明命名）；还没有（选中它靠的是
+    // 「唯一一条映射」兜底）⇒ 用调用方经 [`WorktreeLayout`] 给的模板值。
+    let existing = mapping
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.ticket_id == ticket_id);
+    let worktree_path = existing
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| layout.worktree_path.clone());
+    let worktree_branch = existing
+        .map(|worktree| worktree.branch.clone())
+        .unwrap_or_else(|| layout.worktree_branch.clone());
     Some(WorktreeEstablishRequest {
         spec_id,
         integration_branch,

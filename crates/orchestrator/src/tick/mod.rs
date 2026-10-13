@@ -1,6 +1,6 @@
 //! tick —— tick 循环的决策段：reconcile → **decide（纯函数，零 IO）** → execute（ADR-0001）。
 //!
-//! 本模块只把「本 tick 的世界」映射成「本 tick 要打的契约调用序列」。它不是执行器
+//! 本模块只把「本 tick 的世界」映射成「本 tick 要打的契约调用序列」。它不展开序列
 //! （那是 ticket #4），也不碰钟面：`now` 由 tick 循环注入——世界里的全部时间戳
 //! （`backoff_until`、`event_watermark`）都是宿主事件时间戳形状（RFC3339、UTC、秒级，
 //! 见 `recon` 模块头），字典序即时间序，所以时间判断只需要比较字符串。
@@ -51,7 +51,7 @@ impl EffectiveConfig {
 
 /// 一个 tick 的决策（闭集）：抢票 / 派发 / 交还。tick 无话可说时决策表为空。
 ///
-/// 三种决策各自对应契约面上的一段调用，展开成调用序列是执行器的活（ticket #4）：
+/// 三种决策各自对应契约面上的一段调用，展开成调用序列是 ticket #4 的活：
 ///
 /// * [`Decision::Claim`] → `POST /v1/tracker/claims`
 /// * [`Decision::Dispatch`] → claim 幂等 revalidation → `POST /v1/workspace/worktrees` → `POST /v1/agent-runner/dispatches`

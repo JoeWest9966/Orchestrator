@@ -20,14 +20,15 @@ use farm_sdk::services::workspace::{
 };
 use farm_sdk::workflow::{EffectiveSource, RetryBackoff, WorkflowConfig, WorkflowConfigStatus};
 use farm_sdk::{contract_path, routes, ServiceName};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
 use crate::contract::ws::EventStream;
 use crate::exec::Outcome;
+use crate::test_support::{read_request, CapturedRequest};
 use crate::tick::Decision;
 
 const REPO: &str = "spec-1";
@@ -50,7 +51,7 @@ type Routes = BTreeMap<String, (u16, String)>;
 struct StubHost {
     addr: SocketAddr,
     routes: Arc<Mutex<Routes>>,
-    requests: Arc<Mutex<Vec<(String, String)>>>,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
 }
 
 impl StubHost {
@@ -69,7 +70,8 @@ impl StubHost {
                 let served = Arc::clone(&served);
                 let recorded = Arc::clone(&recorded);
                 tokio::spawn(async move {
-                    let (method, path, _) = read_request(&mut socket).await;
+                    let request = read_request(&mut socket).await;
+                    let path = request.route().to_string();
                     // WS upgrade 不在这台假宿主上：关掉连接，`main_loop` 的订阅任务会告警并重连。
                     if !path.starts_with("/v1/")
                         && !path.starts_with("/admin/")
@@ -78,14 +80,11 @@ impl StubHost {
                         let _ = socket.shutdown().await;
                         return;
                     }
-                    recorded
-                        .lock()
-                        .unwrap()
-                        .push((method.clone(), path.clone()));
+                    recorded.lock().unwrap().push(request.clone());
                     let body = served
                         .lock()
                         .unwrap()
-                        .get(&format!("{method} {path}"))
+                        .get(&format!("{} {}", request.method, request.route()))
                         .cloned();
                     let response = match body {
                         Some((status, body)) => format!(
@@ -95,7 +94,9 @@ impl StubHost {
                         ),
                         None => {
                             let error = farm_sdk::ContractError::not_found(format!(
-                                "stub has no route for {method} {path}"
+                                "stub has no route for {} {}",
+                                request.method,
+                                request.route()
                             ));
                             let body = json(&error);
                             format!(
@@ -141,7 +142,7 @@ impl StubHost {
             .lock()
             .unwrap()
             .iter()
-            .map(|(method, path)| format!("{method} {path}"))
+            .map(|request| format!("{} {}", request.method, request.route()))
             .collect()
     }
 
@@ -152,38 +153,6 @@ impl StubHost {
         }
         counts
     }
-}
-
-async fn read_request(socket: &mut TcpStream) -> (String, String, String) {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    while !buf.ends_with(b"\r\n\r\n") {
-        let read = socket.read(&mut byte).await.expect("read request");
-        if read == 0 {
-            break;
-        }
-        buf.extend_from_slice(&byte[..read]);
-    }
-    let head = String::from_utf8_lossy(&buf).into_owned();
-    let mut lines = head.lines();
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or_default().to_string();
-    let path = target.split('?').next().unwrap_or_default().to_string();
-    let content_length = head
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        socket.read_exact(&mut body).await.expect("read body");
-    }
-    (method, path, String::from_utf8_lossy(&body).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -961,7 +930,8 @@ impl StubWs {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            let (_, path, _) = read_request(&mut socket).await;
+            let request = read_request(&mut socket).await;
+            let path = request.route().to_string();
             assert_eq!(
                 path,
                 contract_path(ServiceName::Events, "/stream"),
@@ -1216,4 +1186,99 @@ async fn a_last_known_good_config_orchestrates_normally_and_is_annotated_every_t
         Some(1),
         "标注不妨碍编排：claim 照发"
     );
+}
+
+#[tokio::test]
+async fn a_hard_failure_cuts_the_tick_short_so_no_further_sequence_is_issued() {
+    // `exec` 的 `Disposition::Fatal` 语义（exec 模块头分流表）：「本 tick 余下的序列不再发契约
+    // 调用」。凭据 / 契约版本 / 路由这类失败对每个决策都会同样失败，继续打只是把同一个错误
+    // 重复 N 次、并把 N 张票都拖进回滚。
+    let mut second = issue(Some(ASSIGNEE), IssueState::Claimed);
+    second.issue_id = "T2".to_string();
+    let two_tickets = IssueListResponse {
+        issues: vec![issue(Some(ASSIGNEE), IssueState::Claimed), second],
+    };
+    let mut wide = workflow();
+    wide.max_concurrency = 2; // 两张票都能派 ⇒ decide 会发两个 Dispatch
+    let host = ready_host(
+        config(Some(wide), Some(EffectiveSource::Fresh)),
+        two_tickets,
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+    // 派发一律 `unauthorized`（不可自愈的硬失败）。
+    host.set_error(
+        "POST",
+        &contract_path(ServiceName::AgentRunner, "/dispatches"),
+        ErrorCode::Unauthorized,
+    );
+    let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
+    let ledger = Mutex::new(EventLedger::default());
+    let mut world = WorldModel::default();
+    let config = test_config(host.addr);
+
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+
+    // 两个决策都定了，但只有一个被执行——第二个被硬失败截断。
+    assert_eq!(report.decisions.len(), 2, "{:?}", report.decisions);
+    assert_eq!(report.cut_short_by.as_deref(), Some(TICKET));
+    assert_eq!(report.outcomes.len(), 1, "{:?}", report.outcomes);
+    assert!(
+        matches!(
+            report.outcomes[0],
+            TickOutcome::Dispatch {
+                outcome: Outcome::HardFailure { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        report.outcomes[0]
+    );
+
+    // 可观察量：派发路由只被打了一次（截断之后没有再发）。
+    let dispatch_path = contract_path(ServiceName::AgentRunner, "/dispatches");
+    let dispatches = host
+        .request_log()
+        .into_iter()
+        .filter(|entry| entry.ends_with(&dispatch_path))
+        .count();
+    assert_eq!(dispatches, 1, "{}", host.request_log().join("\n"));
+}
+
+#[tokio::test]
+async fn a_tick_without_a_hard_failure_is_not_cut_short() {
+    // 反向：没有硬失败时 `cut_short_by` 必须是 `None`，一个决策都不能少。
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        issues(Some(ASSIGNEE), IssueState::Claimed),
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+    let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
+    let ledger = Mutex::new(EventLedger::default());
+    let mut world = WorldModel::default();
+    let config = test_config(host.addr);
+
+    let report = tick_once(
+        &client,
+        &config,
+        &ledger,
+        &mut world,
+        "2026-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+
+    assert_eq!(report.cut_short_by, None);
+    assert_eq!(report.decisions.len(), report.outcomes.len());
 }

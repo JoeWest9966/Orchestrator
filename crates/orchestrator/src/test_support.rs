@@ -74,3 +74,95 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 假宿主共用的 HTTP 请求读取器
+// ---------------------------------------------------------------------------
+
+/// 假宿主收到的一条请求（三个单测模块原来各抄了一份，现在只有这一份）。
+///
+/// `path` 是**完整请求目标**（含查询串）；要断言路由用 [`CapturedRequest::route`]。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CapturedRequest {
+    pub method: String,
+    pub path: String,
+    /// 小写化的 header 名 → 值（鉴权断言用）。
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl CapturedRequest {
+    /// 查询串剥掉后的路径（路由断言用）。
+    pub fn route(&self) -> &str {
+        self.path.split('?').next().unwrap_or(&self.path)
+    }
+
+    /// 取一个 header（名字大小写不敏感；存的时候已小写化）。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// 从 socket 读一条完整的 HTTP 请求（头 + `Content-Length` 指定的体）。
+///
+/// 对端在读完之前就断开 ⇒ 返回 [`CapturedRequest::default`]（与原来的三份实现同款：不猜）。
+pub async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let head_end = loop {
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            return CapturedRequest::default();
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        if let Some(end) = find_subslice(&buf, b"\r\n\r\n") {
+            break end;
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            line.split_once(": ")
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.to_string()))
+        })
+        .collect();
+    let content_length: usize = headers
+        .iter()
+        .find(|(key, _)| key == "content-length")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0);
+
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < content_length {
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+
+    CapturedRequest {
+        method,
+        path,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+/// 在 `haystack` 里找 `needle` 第一次出现的下标。
+pub fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}

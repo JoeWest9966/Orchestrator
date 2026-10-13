@@ -11,7 +11,7 @@ use farm_sdk::handshake::{
     AuthScheme, ClientInfo, ClientKind, HandshakeRequest, HandshakeResponse, CONTRACT_VERSION,
     HANDSHAKE_PATH,
 };
-use farm_sdk::routes::admin_path;
+use farm_sdk::routes::ADMIN_ROUTES;
 use farm_sdk::services::agent_runner::{DispatchRequest, DispatchResponse};
 use farm_sdk::services::events::{EventHistoryQuery, EventHistoryResponse};
 use farm_sdk::services::tracker::{
@@ -218,10 +218,39 @@ impl ContractClient {
         &self,
         repo_id: &str,
     ) -> Result<WorkflowConfigStatus, ContractError> {
-        let path = admin_path(&format!("/workflow/config/{}", percent_encode(repo_id)));
+        let path = admin_repo_path(repo_id);
         let (status, body) = self.admin("GET", &path, None).await?;
         Self::parse(status, &body)
     }
+}
+
+/// 管理面上「按 `repo_id` 查配置」那条路由的实路径。
+///
+/// 路径由 [`ADMIN_ROUTES`]（路由表的单一源，`farm_sdk::routes` 头：「改路径 = 改契约，
+/// 必须三处同步」）渲染，不在这里手写。表里用 `{repo_id}` 占位；找不到唯一一条含它的
+/// workflow 配置路由就 panic——那是契约形状变了，不是调用方该猜的。
+///
+/// 查找键只取 `"/workflow/config/"` 这一小段（用来在表里认出那条路由），完整路径仍然
+/// 来自表本身：改路径只需改表，这里会跟着变。
+pub(super) fn admin_repo_path(repo_id: &str) -> String {
+    const KEY: &str = "/workflow/config/";
+    let templates: Vec<&str> = ADMIN_ROUTES
+        .iter()
+        .map(|route| route.path)
+        .filter(|path| path.contains(KEY))
+        .collect();
+    let [template] = templates.as_slice() else {
+        panic!(
+            "ADMIN_ROUTES must declare exactly one route containing {KEY:?}, found {}",
+            templates.len()
+        );
+    };
+    assert!(
+        template.contains("{repo_id}"),
+        "the workflow config route template must carry a {{repo_id}} placeholder: {template}"
+    );
+    // 表里的 path 已是完整路径（含 `/admin` 前缀）——直接替换占位符，不再拼一次前缀。
+    template.replacen("{repo_id}", &percent_encode(repo_id), 1)
 }
 
 /// 把 [`EventHistoryQuery`] 编成查询串（含前导 `?`；无字段时为空串）。

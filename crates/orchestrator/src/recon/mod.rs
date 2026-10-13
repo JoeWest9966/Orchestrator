@@ -381,6 +381,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use farm_sdk::events::EventEnvelope;
+    use farm_sdk::services::tracker::IssueView;
     use farm_sdk::services::workspace::{WorkspaceMapping, WorktreeRef, WorktreeState};
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -427,16 +428,12 @@ mod tests {
         let log = WarningLog::default();
         let subscriber = tracing_subscriber::registry().with(log.clone());
         tracing::subscriber::with_default(subscriber, body);
-        let alerts = log.0.lock().unwrap().clone();
+        let alerts = log.0.lock().expect("告警锁未被毒化").clone();
         alerts
     }
 
-    fn issue(
-        issue_id: &str,
-        state: IssueState,
-        assignee: Option<&str>,
-    ) -> farm_sdk::services::tracker::IssueView {
-        farm_sdk::services::tracker::IssueView {
+    fn issue(issue_id: &str, state: IssueState, assignee: Option<&str>) -> IssueView {
+        IssueView {
             issue_id: issue_id.to_string(),
             title: issue_id.to_string(),
             state,
@@ -462,13 +459,13 @@ mod tests {
     }
 
     fn for_ticket(
-        mut event: EventEnvelope,
+        mut envelope: EventEnvelope,
         ticket_id: &str,
         attempt_id: Option<&str>,
     ) -> EventEnvelope {
-        event.ticket_id = Some(ticket_id.to_string());
-        event.attempt_id = attempt_id.map(str::to_string);
-        event
+        envelope.ticket_id = Some(ticket_id.to_string());
+        envelope.attempt_id = attempt_id.map(str::to_string);
+        envelope
     }
 
     #[test]

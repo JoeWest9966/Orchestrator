@@ -1,6 +1,6 @@
 //! 端到端演练：**真宿主** + **真编排器二进制**（spawn 成子进程）+ fake-pi（票 #5 验收）。
 //!
-//! 三条演练（票 #5 验收三条逐一对应一个 `#[tokio::test]`）：
+//! 四条演练（票 #5 验收三条 + ticket #6 一条，逐一对应一个 `#[tokio::test]`）：
 //!
 //! 1. `one_ticket_goes_from_open_to_a_merge_event`：票 `open` → `merge` 事件出现，全程编排器
 //!    只是契约客户端。**测试扮演 agent**：在票 worktree 里做出工作提交（路径从
@@ -13,9 +13,11 @@
 //!    （宿主的 claim/事件账在两次运行之间是同一份），且第二次运行确实在跑（日志里有 tick 行）。
 //! 3. `a_corrupt_workflow_json_keeps_orchestrating_on_the_last_known_good`：非法
 //!    `.farm/workflow.json` 下编排器继续用 LKG 编排**并持续标注**（断言编排器日志）。
+//! 4. `a_blocked_by_cycle_is_alerted_once_however_many_ticks_run`：`blocked_by` 成环时环告警
+//!    **只发一次**，不论跑了多少个 tick（ticket #6：治的是同一条 WARN 每 tick 刷一遍）。
 //!
 //! 夹具形状照 skeleton（`tests/common/mod.rs` 的 `TestHost`：真 `farm-host` + fake-pi +
-//! tempdir）。找不到宿主 / fake-pi 就**失败**（不跳过）：这三条演练是票面的验收标准，零断言
+//! tempdir）。找不到宿主 / fake-pi 就**失败**（不跳过）：这几条演练是票面的验收标准，零断言
 //! 的绿不是绿（`common::require_host_and_fake_pi`）。跑起来之后用「防空洞」断言检查条数，
 //! 保证「静默半途而废」不能伪装成绿。
 
@@ -32,12 +34,15 @@ use orchestrator::main_loop::{ENV_ASSIGNEE, ENV_HOST, ENV_WORKTREE_BRANCH, ENV_W
 
 use common::{
     events_of_kind, git, poll, propose_merge, require_host_and_fake_pi, scaffold_repo, Checks,
-    OrchestratorEnv, OrchestratorRun, TestHost, INTEGRATION, SEED_LABEL, SPEC,
+    OrchestratorEnv, OrchestratorRun, TestHost, TicketSeed, INTEGRATION, SEED_LABEL, SPEC,
 };
 
 /// 被编排的那张票（宿主播种的原生票号即票 id）。
 const TICKET: &str = "7";
 const TICKET_NUMBER: u32 = 7;
+/// 演练 4 的环：`A` 被 `B` 堵、`B` 被 `A` 堵（谁都不 dispatchable）。
+const CYCLE_A: u32 = 10;
+const CYCLE_B: u32 = 11;
 /// 夹具前置的「早先那张票」：它的映射给出本编排器的 spec / 集成分支。
 ///
 /// 它**不是**一张被播种的 issue（只在 workspace 映射里存在）：这样它不会挤进 frontier 抢
@@ -505,6 +510,105 @@ async fn a_corrupt_workflow_json_keeps_orchestrating_on_the_last_known_good() {
     assert!(
         checks.len() >= 6,
         "防空洞：至少 6 条机械断言，实际 {}",
+        checks.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 演练 4：环依赖告警只发一次（ticket #6）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_blocked_by_cycle_is_alerted_once_however_many_ticks_run() {
+    // 票 #6 要治的正是这个症状：AFK 编排器的日志被同一条 WARN 每 tick 刷一遍。真宿主 + 真二进制
+    // 才看得见「日志里到底有几条」，所以这条演练钉的是**日志文本**。
+    let (_host_bin, fake_pi) = require_host_and_fake_pi();
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let repo = scratch.path().join("repo");
+    let worktrees = scratch.path().join("worktrees");
+    scaffold_repo(&repo, &workflow_json());
+
+    // 两张互卡的票：`A` 被 `B` 堵、`B` 被 `A` 堵 ⇒ 谁都不 dispatchable，环一直成环。
+    let host = TestHost::spawn_seeded(
+        &[
+            TicketSeed {
+                number: CYCLE_A,
+                blocked_by: vec![CYCLE_B],
+            },
+            TicketSeed {
+                number: CYCLE_B,
+                blocked_by: vec![CYCLE_A],
+            },
+        ],
+        &[
+            ("FARM_AGENT_PROGRAM", fake_pi.to_string_lossy().into_owned()),
+            ("FAKE_PI_SCENARIO", "silence".to_string()),
+            (
+                "FARM_MERGE_TEST_COMMAND",
+                passing_test_script(scratch.path()),
+            ),
+        ],
+    )
+    .await;
+    let client = host.client();
+    // 夹具前置：一条既存映射给出 repo_id（生效配置的键）；环上的票不掺和。
+    bootstrap_mapping(&client, &repo, &worktrees).await;
+
+    let env = OrchestratorEnv::new(host.addr, &repo.to_string_lossy(), &worktrees);
+    let mut orchestrator = OrchestratorRun::spawn(&env, scratch.path().join("orchestrator.log"));
+
+    // ① 至少三个 tick 真的过去了（同一条告警若每 tick 重发，下面就会数到三条以上）。
+    let ticks = poll(Duration::from_secs(30), || async {
+        let lines = orchestrator
+            .log()
+            .lines()
+            .filter(|line| is_tick_line(line))
+            .count();
+        (lines >= 3).then_some(lines)
+    })
+    .await;
+    assert!(
+        ticks.is_some(),
+        "编排器没在跑 tick：\n{}",
+        orchestrator.log()
+    );
+
+    let log = orchestrator.log();
+    let mut checks = Checks::default();
+    checks.record(
+        "the blocked_by cycle is alerted exactly once across many ticks",
+        log.matches("blocked_by_cycle").count() == 1,
+        format!(
+            "{} tick lines, {} occurrences of alert=blocked_by_cycle",
+            ticks.unwrap_or_default(),
+            log.matches("blocked_by_cycle").count()
+        ),
+    );
+    checks.record(
+        "the alert names the tickets on the cycle",
+        log.contains(&format!("{CYCLE_A},{CYCLE_B}")),
+        format!("tickets={CYCLE_A},{CYCLE_B}"),
+    );
+    checks.record(
+        "the cycle never becomes dispatchable (no dispatch event on either ticket)",
+        events_of_kind(&client, &CYCLE_A.to_string(), EventKind::Dispatch)
+            .await
+            .is_empty()
+            && events_of_kind(&client, &CYCLE_B.to_string(), EventKind::Dispatch)
+                .await
+                .is_empty(),
+        "no dispatch events".to_string(),
+    );
+    checks.record(
+        "the orchestrator keeps ticking (a cycle is not a fatal condition)",
+        orchestrator.is_alive(),
+        "process alive".to_string(),
+    );
+
+    assert!(checks.all_ok(), "端到端没跑绿：\n{}", checks.render());
+    assert!(
+        checks.len() >= 4,
+        "防空洞：至少 4 条机械断言，实际 {}",
         checks.len()
     );
 }

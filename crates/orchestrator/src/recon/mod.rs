@@ -1,11 +1,13 @@
 //! recon —— 世界模型与对账重建（ADR-0002：零持久状态）。
 //!
 //! 编排器不落任何本地状态：进程内只有 [`WorldModel`]，进程死掉那一刻的世界被视为可再生数据。
-//! 重建的输入是宿主契约面的三份只读快照（ticket #2 范围）：
+//! 每个 tick 宿主契约面被读三份只读快照（ticket #2 范围）：
 //!
 //! 1. `GET /v1/tracker/issues` 快照 —— `assignee == FARM_ASSIGNEE` 即我的 claim（claim 判定）；
 //! 2. `GET /v1/events/history`（增量，`since = event_watermark`）—— 活跃 attempt / 完成信号 / 冷却起点；
 //! 3. `GET /v1/workspace/mappings` —— 已建 worktree 与集成分支。
+//!
+//! **世界只由前两份推出**：第三份与 attempt 的生命周期正交（见下文）。
 //!
 //! **时间戳形状**：本模块产出的时间戳一律是宿主事件时间戳的形状（RFC3339、UTC、秒级，如
 //! `2026-01-01T00:00:00Z`；宿主 `now_rfc3339` 写入，`event_log.rs::canonical_timestamp` 对查询
@@ -14,15 +16,23 @@
 //!
 //! `WorldModel` 的五个字段全部来自前两个源。第三份快照（workspace mappings）与 attempt 的
 //! 生命周期正交——worktree 在 claim 之后、dispatch 之前就已存在，`WorktreeState` 也不描述尝试——
-//! 所以它在本模块里是**退化路径的诊断依据**（截断告警说明回退用的是 issues 快照 + mappings），
-//! 不是任何字段的输入；worktree 的复用判定归 decide / exec（ticket #3/#4）。
+//! 所以它**不是任何字段的输入**，[`rebuild`] 也不收它；worktree 的复用判定归 decide / exec
+//! （ticket #3/#4）。
+//!
+//! ## 本模块不告警
+//!
+//! 环依赖（[`blocked_by_cycles`]）与保留窗口截断的**告警不在这里发**（ticket #6）：两者说的都是
+//! **世界的事实**（环会一直成环、宿主忙时最近一页会一直被截断），不随 tick 翻转，所以「同一
+//! 事实只告警一次」的去重位只能在调用方；而纯函数记不住自己说过什么，调用方也没法给自己没印发
+//! 过的告警去重——于是判据留给本模块（数据），发放与去重归 `main_loop`
+//! （[`AlertDedup`](crate::main_loop::AlertDedup)）。本模块因此保持「数据进、数据出」：零 IO、
+//! 零持久状态、零日志副作用。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use farm_sdk::events::EventKind;
 use farm_sdk::services::events::EventHistoryResponse;
 use farm_sdk::services::tracker::{IssueListResponse, IssueState};
-use farm_sdk::services::workspace::MappingListResponse;
 use farm_sdk::workflow::RetryBackoff;
 use serde::{Deserialize, Serialize};
 
@@ -45,16 +55,19 @@ pub struct WorldModel {
     pub backoff_until: BTreeMap<String, String>,
 }
 
-/// 三源对账重建（纯函数：零 IO、零持久状态）。
+/// 对账重建（纯函数：零 IO、零持久状态、零日志）。
 ///
 /// `assignee` 是 `FARM_ASSIGNEE`；`previous_watermark` 是上一次 world 的 `event_watermark`
 /// （本次增量拉取用的 `since`），空页时游标不回退；`retry_backoff` 是 effective 配置里的
 /// `WorkflowConfig::retry_backoff`（冷却只消费它，不自带常数）。
+///
+/// 输入里**没有** workspace mappings：它与 attempt 的生命周期正交（见模块头），世界用不到它。
+/// 环依赖（[`blocked_by_cycles`]）与保留窗口截断的告警也不在这里发——见模块头「本模块不告警」
+/// （ticket #6）。
 pub fn rebuild(
     assignee: &str,
     issues: &IssueListResponse,
     history: &EventHistoryResponse,
-    mappings: &MappingListResponse,
     previous_watermark: Option<&str>,
     retry_backoff: &RetryBackoff,
 ) -> WorldModel {
@@ -96,29 +109,16 @@ pub fn rebuild(
         }
     }
 
-    // 环依赖：`blocked_by` 成环时不能 panic（也不得挂死）——环里的票永远算不出 frontier，
-    // 只告警一次，把判断留给人的裁决。检测用 SCC（自环也算）。
-    for group in blocked_by_cycles(issues) {
-        tracing::warn!(
-            alert = "blocked_by_cycle",
-            tickets = group.join(",").as_str(),
-            "blocked_by 成环：环上的票永远不会 dispatchable"
-        );
-    }
-
     // 保留窗口截断：事件账不全 ⇒ 完成信号回退 issues 快照的 `state == done`（ticket #2 的
     // 退化路径）。绝不从缺失的事件里凭空补状态——推不出的就留给下一个 tick。
+    //
+    // 截断的**告警**由调用方发（ticket #6）：本函数每次调用都从零推世界，没法记住「这条说过了」。
     if history.truncated {
         for issue in &issues.issues {
             if issue.state == IssueState::Done {
                 merge_done.insert(issue.issue_id.clone());
             }
         }
-        tracing::warn!(
-            alert = "history_truncated",
-            mappings = mappings.mappings.len(),
-            "事件历史被保留窗口截断：完成信号回退 issues 快照 + workspace mappings"
-        );
     }
 
     WorldModel {
@@ -139,9 +139,11 @@ pub fn rebuild(
 /// 边 = `IssueView.blocked_by`（加法字段，声明方向：堵住本票的票）。只在快照里的票才有出边；
 /// 被引用而不在快照里的票（未取到 / 不在视图）当作无出边的节点，不猜它们的依赖。
 ///
-/// 告警的**跨 tick 去重是调用方的活**：本函数是纯函数、零持久状态（ADR-0002），所以每次调用
-/// 都会重新报告同一个环；world 的闭集字段里没有放这个去重位的地方。
-fn blocked_by_cycles(issues: &IssueListResponse) -> Vec<Vec<String>> {
+/// **判据在这里，告警不在这里**（ticket #6）：本函数是纯函数、零持久状态（ADR-0002），每次
+/// 调用都会重新推出同一个环，所以「环只告警一次」的去重与发放都只能由调用方做
+/// （`main_loop` 的 [`AlertDedup`](crate::main_loop::AlertDedup)）。本函数只回答「这份快照里
+/// 有哪些环」这一个问题。
+pub fn blocked_by_cycles(issues: &IssueListResponse) -> Vec<Vec<String>> {
     let mut ids: BTreeSet<&str> = BTreeSet::new();
     for issue in &issues.issues {
         ids.insert(issue.issue_id.as_str());
@@ -386,60 +388,10 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use farm_sdk::events::EventEnvelope;
     use farm_sdk::services::tracker::IssueView;
-    use farm_sdk::services::workspace::{WorkspaceMapping, WorktreeRef, WorktreeState};
-    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
-
-    /// 观测 `recon` 告警的层：每条 WARN 记下它的 `alert` 字段与 `tickets` 字段
-    /// （告警可观测＝验收的一部分）。
-    #[derive(Clone, Default)]
-    struct WarningLog(Arc<Mutex<Vec<(String, String)>>>);
-
-    #[derive(Default)]
-    struct AlertFields {
-        alert: String,
-        tickets: String,
-    }
-
-    impl tracing::field::Visit for AlertFields {
-        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            match field.name() {
-                "alert" => self.alert = value.to_string(),
-                "tickets" => self.tickets = value.to_string(),
-                _ => {}
-            }
-        }
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningLog {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _context: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().level() == &tracing::Level::WARN {
-                let mut fields = AlertFields::default();
-                event.record(&mut fields);
-                self.0.lock().unwrap().push((fields.alert, fields.tickets));
-            }
-        }
-    }
-
-    /// 在收集告警的 subscriber 下跑一段代码，返回收集到的 `(alert, tickets)`。
-    fn capture_warnings(body: impl FnOnce()) -> Vec<(String, String)> {
-        crate::test_support::install_global_noop_subscriber();
-        let log = WarningLog::default();
-        let subscriber = tracing_subscriber::registry().with(log.clone());
-        tracing::subscriber::with_default(subscriber, body);
-        let alerts = log.0.lock().expect("告警锁未被毒化").clone();
-        alerts
-    }
 
     fn issue(issue_id: &str, state: IssueState, assignee: Option<&str>) -> IssueView {
         IssueView {
@@ -499,9 +451,6 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         // 冷却档位：首档 = base_delay_ms（1s），退避倍率 2。
         let backoff = RetryBackoff {
             max_retries: 3,
@@ -509,7 +458,7 @@ mod tests {
             backoff_multiplier: 2,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(world.claimed_by_me, BTreeSet::from(["T1".to_string()]));
         assert!(
@@ -542,35 +491,19 @@ mod tests {
             events: Vec::new(),
             truncated: true,
         };
-        let mappings = MappingListResponse {
-            mappings: vec![WorkspaceMapping {
-                spec_id: "spec-1".to_string(),
-                integration_branch: "feat/spec-1".to_string(),
-                worktrees: vec![WorktreeRef {
-                    ticket_id: "T1".to_string(),
-                    path: "/tmp/wt/T1".to_string(),
-                    branch: "feat/T1".to_string(),
-                    state: WorktreeState::Ready,
-                }],
-            }],
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 1_000,
             backoff_multiplier: 2,
         };
 
-        let mut world = WorldModel::default();
-        let alerts = capture_warnings(|| {
-            world = rebuild(
-                "orch-1",
-                &issues,
-                &history,
-                &mappings,
-                Some("2026-01-01T00:00:05Z"),
-                &backoff,
-            );
-        });
+        let world = rebuild(
+            "orch-1",
+            &issues,
+            &history,
+            Some("2026-01-01T00:00:05Z"),
+            &backoff,
+        );
 
         assert_eq!(
             world.merge_done,
@@ -591,16 +524,12 @@ mod tests {
             Some("2026-01-01T00:00:05Z"),
             "空页不回退游标"
         );
-        assert_eq!(
-            alerts,
-            vec![("history_truncated".to_string(), String::new())],
-            "退化路径要告警一次"
-        );
     }
 
     #[test]
-    fn a_blocked_by_cycle_does_not_panic_and_warns_once() {
-        // 环依赖票：重建不得 panic、不得挂死，告警一次（ticket #2 验收第 3 条）。
+    fn a_blocked_by_cycle_does_not_panic_and_leaves_the_rest_of_the_world_alone() {
+        // 环依赖票：重建不得 panic、不得挂死，环上的票永远算不出 frontier（ticket #2 验收第 3 条）。
+        // 告警的发放与去重不在这里——见模块头「本模块不告警」（ticket #6）。
         let mut blocked_a = issue("A", IssueState::Open, None);
         blocked_a.blocked_by = vec!["B".to_string()];
         let mut blocked_b = issue("B", IssueState::Open, None);
@@ -618,24 +547,18 @@ mod tests {
             events: Vec::new(),
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 1_000,
             backoff_multiplier: 2,
         };
 
-        let mut world = WorldModel::default();
-        let alerts = capture_warnings(|| {
-            world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
-        });
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(
-            alerts,
-            vec![("blocked_by_cycle".to_string(), "A,B,C".to_string())],
-            "环只告警一次，且点名的只有环上的票"
+            blocked_by_cycles(&issues),
+            vec![vec!["A".to_string(), "B".to_string(), "C".to_string()]],
+            "点名的只有环上的票：依赖环的 S 不在环上"
         );
         assert_eq!(
             world.claimed_by_me,
@@ -657,12 +580,9 @@ mod tests {
             events: Vec::new(),
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff::default();
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(
             world.claimed_by_me,
@@ -691,16 +611,13 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 1_000,
             backoff_multiplier: 2,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(world.merge_done, BTreeSet::from(["T1".to_string()]));
         assert!(
@@ -731,16 +648,12 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff::default();
 
         let world = rebuild(
             "orch-1",
             &issues,
             &history,
-            &mappings,
             Some("2026-01-01T00:00:00Z"),
             &backoff,
         );
@@ -797,16 +710,13 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 2_000,
             backoff_multiplier: 2,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(
             world.backoff_until,
@@ -853,16 +763,13 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 2_000,
             backoff_multiplier: 2,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(
             world.active_attempts,
@@ -895,16 +802,13 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 2_000,
             backoff_multiplier: 2,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
         let json = serde_json::to_value(&world).expect("world 可序列化");
 
         let keys: BTreeSet<&str> = json
@@ -986,16 +890,13 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 1,
             base_delay_ms: 1_000,
             backoff_multiplier: 3,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(
             world.backoff_until.get("T1").map(String::as_str),
@@ -1015,25 +916,13 @@ mod tests {
             events: Vec::new(),
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
 
-        let mut world = WorldModel::default();
-        let alerts = capture_warnings(|| {
-            world = rebuild(
-                "orch-1",
-                &issues,
-                &history,
-                &mappings,
-                None,
-                &RetryBackoff::default(),
-            );
-        });
+        let world = rebuild("orch-1", &issues, &history, None, &RetryBackoff::default());
 
         assert_eq!(
-            alerts,
-            vec![("blocked_by_cycle".to_string(), "A".to_string())]
+            blocked_by_cycles(&issues),
+            vec![vec!["A".to_string()]],
+            "自环也是环"
         );
         assert_eq!(world, WorldModel::default());
     }
@@ -1059,16 +948,13 @@ mod tests {
             ],
             truncated: false,
         };
-        let mappings = MappingListResponse {
-            mappings: Vec::new(),
-        };
         let backoff = RetryBackoff {
             max_retries: 3,
             base_delay_ms: 1_000,
             backoff_multiplier: 2,
         };
 
-        let world = rebuild("orch-1", &issues, &history, &mappings, None, &backoff);
+        let world = rebuild("orch-1", &issues, &history, None, &backoff);
 
         assert_eq!(
             world.backoff_until.get("T1").map(String::as_str),

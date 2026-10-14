@@ -35,6 +35,23 @@
 //! 账（按事件 id 去重），tick 把整本账交给 `rebuild`。增量拉取同时是 WS 掉线时的兜底——
 //! 世界的权威来源仍是契约面的拉取，推送只是把同一个事实更早地记下来。
 //!
+//! ## 告警去重：「一次」（ticket #6）
+//!
+//! `recon` 的环依赖（`blocked_by_cycle`）与保留窗口截断（`history_truncated`）两条告警说的是
+//! **世界的事实**，不是某一次读数：环会一直成环，宿主忙时「最近一页被截断」是常态。而
+//! [`recon::rebuild`] 每次从零推世界，记不住「这条我已经说过了」——于是**发放与去重都落在
+//! 本模块**（[`tick_once`] 的第 4b 步，`annotate_world_facts`）：调用方没法给自己没印发过的
+//! 告警去重，所以判据（[`recon::blocked_by_cycles`] / 账上的截断位）由 `recon` 给，话由本模块说。
+//! 去重位是一份逐进程的 [`AlertDedup`]，由 [`run`] 的循环持有：
+//!
+//! * 键 = `alert` + 同一组票（[`AlertDedup::first_sighting`]）。环上的票换了一组就是另一条
+//!   告警，该说的还是要说；不带票组的告警（截断）空组即一把钥匙，整个进程只发一次。
+//! * 与 ADR-0004 的 LKG「持续标注」**不是**一回事：那一条说的是「本 tick 在用什么配置」——
+//!   活的配置状态，每 tick 一条（`annotate_config_state`），**不**去重。事实不随 tick 翻转
+//!   才去重；「读不到某份读数」那一类也是当期事实（每个 tick 各自失败），照旧每 tick 一条。
+//! * 代价（记在案）：「一次」是**曾经一次**，不是「条件每次成立时一次」。晚到的读日志的人
+//!   看不到它——所以去重只用在事实类告警上，配置状态与失败类仍持续说。
+//!
 //! ## 钟面（`now`）
 //!
 //! `decide` 收一个 `now: &str`，冷却判定是**字典序**比较（ticket #3）。所以注入的钟面必须
@@ -84,6 +101,7 @@
 //! （重启 → 对账重建 → 不双派）正是建立在「claim 不随进程消失」上的，退出时主动交还反而
 //! 把「我还有一张正在跑的票」这件事抹掉了。
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -91,6 +109,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use farm_sdk::events::EventEnvelope;
 use farm_sdk::handshake::is_compatible;
 use farm_sdk::services::events::{EventHistoryQuery, EventHistoryResponse};
+use farm_sdk::services::tracker::IssueListResponse;
 use farm_sdk::services::workspace::MappingListResponse;
 use farm_sdk::workflow::{EffectiveSource, WorkflowConfigStatus};
 use farm_sdk::{ContractError, ErrorCode};
@@ -320,6 +339,50 @@ impl EventLedger {
 }
 
 // ---------------------------------------------------------------------------
+// 告警去重（ticket #6）
+// ---------------------------------------------------------------------------
+
+/// 逐进程的告警去重账：**同一 `alert` + 同一组票只发一次**。
+///
+/// 它由 [`run`] 的循环持有（一个进程一份），跟着 tick 一路传下去。为什么去重位只能在调用方：
+/// [`recon::rebuild`] 每次从零推世界（纯函数、零持久状态，ADR-0002），它必然每次都重新推出
+/// 同一个环、重新看到同一个截断位；而调用方没法给自己**没印发过**的告警去重——所以发放也
+/// 一并在调用方（`annotate_world_facts`），`recon` 只出判据。
+///
+/// 去重的是**世界事实**类告警（见模块头「告警去重」）；配置状态标注（ADR-0004 的 LKG）与
+/// 「读不到」类失败都是当期事实，照旧每 tick 一条。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlertDedup {
+    /// 已发过的键：`alert` + `|` + 票组（空票组 = 这条告警不带票组）。
+    seen: BTreeSet<String>,
+}
+
+impl AlertDedup {
+    /// 一本空账（一条告警都还没发过）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 这条告警在本进程里是不是**第一次**露面：是 ⇒ 登记并返回 `true`（调用方发那条 WARN）。
+    ///
+    /// 键带票组：环上的票换了一组就是另一条告警（该说的还是要说）；不带票组的告警传空串，
+    /// 空组即一把钥匙，整个进程只发一次。
+    pub fn first_sighting(&mut self, alert: &str, tickets: &str) -> bool {
+        self.seen.insert(format!("{alert}|{tickets}"))
+    }
+
+    /// 已发过几条（机械断言用）。
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// 一条都还没发过。
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 一次 tick
 // ---------------------------------------------------------------------------
 
@@ -356,8 +419,9 @@ pub struct TickReport {
 
 /// 跑一个完整的 tick（模块头的六步）。
 ///
-/// `world` 是上一个 tick 重建出的世界（就地刷新）；`now` 是本 tick 注入的钟面
-/// （RFC3339、UTC、秒级，见模块头）。读不到某一份读数时**不猜**：告警 + 本 tick 不编排。
+/// `world` 是上一个 tick 重建出的世界（就地刷新）；`alerts` 是本进程的告警去重账
+/// （ticket #6，见模块头「告警去重」）；`now` 是本 tick 注入的钟面（RFC3339、UTC、秒级，
+/// 见模块头）。读不到某一份读数时**不猜**：告警 + 本 tick 不编排。
 ///
 /// 世界里的 `backoff_until` 是**两路**冷却的并集：事件流折叠出的（`recon`）与 `exec` 失败
 /// 回滚交回的（本模块折进，见函数里的第 6b 步）。
@@ -366,6 +430,7 @@ pub async fn tick_once(
     config: &OrchestratorConfig,
     ledger: &Mutex<EventLedger>,
     world: &mut WorldModel,
+    alerts: &mut AlertDedup,
     now: &str,
     tick: u64,
 ) -> TickReport {
@@ -464,7 +529,6 @@ pub async fn tick_once(
         &config.assignee,
         &issues,
         &page,
-        &mappings,
         previous_watermark.as_deref(),
         &retry_backoff,
     );
@@ -474,6 +538,9 @@ pub async fn tick_once(
             *kept = deadline;
         }
     }
+
+    // 4b. recon 的两条「世界事实」告警：判据在手，发放受 `alerts` 去重（ticket #6）。
+    annotate_world_facts(alerts, &issues, &page, &mappings, tick);
 
     // 5. decide（纯函数；`now` 是注入的钟面，不在这里取时钟）。
     let decisions = tick::decide(world, &issues, &effective, now);
@@ -674,6 +741,44 @@ fn annotate_config_state(
     }
 }
 
+/// `recon` 的两条「世界事实」告警：**同一 `alert` + 同一组票只发一次**（ticket #6）。
+///
+/// 与 `annotate_config_state` 的分界：那一条说的是「本 tick 在用什么配置」——LKG 是活的配置
+/// 状态，ADR-0004 要求每 tick 一条；这两条说的是**世界的事实**（环会一直成环、宿主忙时最近
+/// 一页会一直被截断），事实不随 tick 翻转，所以去重。反过来，「读不到某份读数」是当期事实
+/// （每个 tick 各自失败），不去重。
+///
+/// 判据不在这里算：环是 [`recon::blocked_by_cycles`] 从归一化视图推的；截断位是事件账上
+/// **当前那一页**的读数（[`EventLedger::absorb`] 每次拉取重取，不粘——粘住就等于把 `recon`
+/// 的退化路径钉成稳态）。
+fn annotate_world_facts(
+    alerts: &mut AlertDedup,
+    issues: &IssueListResponse,
+    page: &EventHistoryResponse,
+    mappings: &MappingListResponse,
+    tick: u64,
+) {
+    for group in recon::blocked_by_cycles(issues) {
+        let tickets = group.join(",");
+        if alerts.first_sighting("blocked_by_cycle", &tickets) {
+            tracing::warn!(
+                alert = "blocked_by_cycle",
+                tickets = tickets.as_str(),
+                tick,
+                "blocked_by 成环：环上的票永远不会 dispatchable"
+            );
+        }
+    }
+    if page.truncated && alerts.first_sighting("history_truncated", "") {
+        tracing::warn!(
+            alert = "history_truncated",
+            mappings = mappings.mappings.len(),
+            tick,
+            "事件历史被保留窗口截断：完成信号回退 issues 快照 + workspace mappings"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 主循环
 // ---------------------------------------------------------------------------
@@ -743,12 +848,23 @@ pub async fn run(
     ));
 
     let mut world = WorldModel::default();
+    // 告警去重账：一个进程一份，跟着 tick 走（ticket #6）。
+    let mut alerts = AlertDedup::default();
     let mut tick = 0u64;
     loop {
         tick += 1;
         // 钟面在**这一处**取，然后作为字符串注入决策路径（模块头「钟面」）。
         let now = host_timestamp(SystemTime::now());
-        tick_once(&client, &config, &ledger, &mut world, &now, tick).await;
+        tick_once(
+            &client,
+            &config,
+            &ledger,
+            &mut world,
+            &mut alerts,
+            &now,
+            tick,
+        )
+        .await;
 
         tokio::select! {
             _ = tokio::time::sleep(config.tick_interval) => {}

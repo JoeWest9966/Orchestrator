@@ -486,6 +486,7 @@ async fn a_tick_reads_mappings_config_issues_and_the_event_increment_in_that_ord
         &test_config(host.addr),
         &ledger,
         &mut world,
+        &mut AlertDedup::default(),
         "2026-01-01T00:00:00Z",
         1,
     )
@@ -532,6 +533,7 @@ async fn the_next_tick_dispatches_the_ticket_i_hold_and_then_releases_the_merged
     let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
     let ledger = Mutex::new(EventLedger::default());
     let mut world = WorldModel::default();
+    let mut alerts = AlertDedup::default();
     let config = test_config(host.addr);
 
     tick_once(
@@ -539,6 +541,7 @@ async fn the_next_tick_dispatches_the_ticket_i_hold_and_then_releases_the_merged
         &config,
         &ledger,
         &mut world,
+        &mut alerts,
         "2026-01-01T00:00:00Z",
         1,
     )
@@ -555,6 +558,7 @@ async fn the_next_tick_dispatches_the_ticket_i_hold_and_then_releases_the_merged
         &config,
         &ledger,
         &mut world,
+        &mut alerts,
         "2026-01-01T00:00:01Z",
         2,
     )
@@ -616,6 +620,7 @@ async fn the_next_tick_dispatches_the_ticket_i_hold_and_then_releases_the_merged
         &config,
         &ledger,
         &mut world,
+        &mut alerts,
         "2026-01-01T00:00:06Z",
         3,
     )
@@ -658,6 +663,7 @@ async fn a_failed_dispatch_puts_the_ticket_in_cooldown_so_the_next_tick_does_not
     let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
     let ledger = Mutex::new(EventLedger::default());
     let mut world = WorldModel::default();
+    let mut alerts = AlertDedup::default();
     let config = test_config(host.addr);
 
     let report = tick_once(
@@ -665,6 +671,7 @@ async fn a_failed_dispatch_puts_the_ticket_in_cooldown_so_the_next_tick_does_not
         &config,
         &ledger,
         &mut world,
+        &mut alerts,
         "2026-01-01T00:00:00Z",
         1,
     )
@@ -695,6 +702,7 @@ async fn a_failed_dispatch_puts_the_ticket_in_cooldown_so_the_next_tick_does_not
         &config,
         &ledger,
         &mut world,
+        &mut alerts,
         "2026-01-01T00:00:00Z",
         2,
     )
@@ -716,6 +724,7 @@ async fn a_failed_dispatch_puts_the_ticket_in_cooldown_so_the_next_tick_does_not
         &config,
         &ledger,
         &mut world,
+        &mut alerts,
         "2026-01-01T00:00:02Z",
         3,
     )
@@ -770,6 +779,7 @@ async fn a_tick_that_cannot_pin_the_repo_id_stays_idle_and_does_not_invent_a_con
         &test_config(host.addr),
         &ledger,
         &mut world,
+        &mut AlertDedup::default(),
         "2026-01-01T00:00:00Z",
         1,
     )
@@ -818,7 +828,6 @@ fn a_truncated_pull_does_not_latch_the_fallback_for_the_rest_of_the_process() {
         ASSIGNEE,
         &issues(Some(ASSIGNEE), IssueState::Done),
         &ledger.page(),
-        &mappings(Vec::new()),
         None,
         &RetryBackoff::default(),
     );
@@ -860,7 +869,6 @@ async fn a_newer_page_followed_by_an_older_one_still_shows_the_attempt_as_active
         ASSIGNEE,
         &issues(Some(ASSIGNEE), IssueState::Claimed),
         &ledger.page(),
-        &mappings(Vec::new()),
         None,
         &RetryBackoff::default(),
     );
@@ -1033,21 +1041,43 @@ async fn the_ws_task_only_books_events_and_never_touches_the_decision_path() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) ADR-0004 三态
+// (d) ADR-0004 三态 + (e) 告警去重（ticket #6）
 // ---------------------------------------------------------------------------
 
-/// 观测 `alert` 字段的层（标注是验收的一部分）。
+/// 收集到的告警：`(alert, tickets)`（只收 WARN；`tickets` 空 = 这条告警不带票组）。
+type Alerts = Vec<(String, String)>;
+
+/// 名叫 `alert` 的告警出现了几次（「只发一次」的判据）。
+fn alert_count(alerts: &Alerts, alert: &str) -> usize {
+    alerts.iter().filter(|(name, _)| name == alert).count()
+}
+
+/// 名叫 `alert` 的告警**依次**点名的票组（去重键带票组，这里看得见）。
+fn alert_tickets<'a>(alerts: &'a Alerts, alert: &str) -> Vec<&'a str> {
+    alerts
+        .iter()
+        .filter(|(name, _)| name == alert)
+        .map(|(_, tickets)| tickets.as_str())
+        .collect()
+}
+
+/// 观测 `alert` / `tickets` 字段的层（标注与去重都是验收的一部分）。
 #[derive(Clone, Default)]
-struct AlertLog(Arc<Mutex<Vec<String>>>);
+struct AlertLog(Arc<Mutex<Alerts>>);
 
 #[derive(Default)]
-struct AlertFields(String);
+struct AlertFields {
+    alert: String,
+    tickets: String,
+}
 
 impl tracing::field::Visit for AlertFields {
     fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "alert" {
-            self.0 = value.to_string();
+        match field.name() {
+            "alert" => self.alert = value.to_string(),
+            "tickets" => self.tickets = value.to_string(),
+            _ => {}
         }
     }
 }
@@ -1061,16 +1091,33 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AlertLog {
         if event.metadata().level() == &tracing::Level::WARN {
             let mut fields = AlertFields::default();
             event.record(&mut fields);
-            if !fields.0.is_empty() {
-                self.0.lock().unwrap().push(fields.0);
+            if !fields.alert.is_empty() {
+                self.0.lock().unwrap().push((fields.alert, fields.tickets));
             }
         }
     }
 }
 
-/// 在收集 `alert` 的 subscriber 下跑一个 tick（current_thread：订阅器是线程局部的，
-/// 单线程运行时下整个 future 都在同一个线程上走）。
-async fn tick_with_alerts(host: &StubHost, now: &str) -> (TickReport, Vec<String>) {
+/// 去重账在多个 tick 之间的活法（`run` 的循环是前者）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DedupScope {
+    /// 一个进程一份：跨 tick 共用（这正是要去重的那个形状）。
+    Shared,
+    /// 每个 tick 一份新的：对照组——证明「只发一次」是去重账的功劳，不是世界没变。
+    PerTick,
+}
+
+/// 在收集告警的 subscriber 下跑 `count` 个 tick：同一份世界、同一本账（与 `run` 的循环同形），
+/// 每个 tick 之前先调 `before_tick`（换假宿主的读数用）。
+///
+/// current_thread：订阅器是线程局部的，单线程运行时下整个 future 都在同一个线程上走。
+async fn ticks_with_alerts(
+    host: &StubHost,
+    now: &str,
+    count: usize,
+    scope: DedupScope,
+    mut before_tick: impl FnMut(usize),
+) -> (Vec<TickReport>, Alerts) {
     let log = AlertLog::default();
     let subscriber = tracing_subscriber::registry().with(log.clone());
     crate::test_support::install_global_noop_subscriber();
@@ -1078,17 +1125,35 @@ async fn tick_with_alerts(host: &StubHost, now: &str) -> (TickReport, Vec<String
     let client = ContractClient::new(host.addr, "op".to_string(), Some("admin".to_string()));
     let ledger = Mutex::new(EventLedger::default());
     let mut world = WorldModel::default();
-    let report = tick_once(
-        &client,
-        &test_config(host.addr),
-        &ledger,
-        &mut world,
-        now,
-        1,
-    )
-    .await;
+    let mut shared = AlertDedup::default();
+    let mut reports = Vec::with_capacity(count);
+    for tick in 1..=count {
+        before_tick(tick);
+        let alerts = match scope {
+            DedupScope::Shared => &mut shared,
+            DedupScope::PerTick => &mut AlertDedup::default(),
+        };
+        reports.push(
+            tick_once(
+                &client,
+                &test_config(host.addr),
+                &ledger,
+                &mut world,
+                alerts,
+                now,
+                tick as u64,
+            )
+            .await,
+        );
+    }
     let alerts = log.0.lock().unwrap().clone();
-    (report, alerts)
+    (reports, alerts)
+}
+
+/// 在收集告警的 subscriber 下跑**一个** tick（单 tick 的断言用它）。
+async fn tick_with_alerts(host: &StubHost, now: &str) -> (TickReport, Alerts) {
+    let (mut reports, alerts) = ticks_with_alerts(host, now, 1, DedupScope::Shared, |_| {}).await;
+    (reports.remove(0), alerts)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1108,8 +1173,9 @@ async fn effective_none_is_idle_with_an_alert_and_no_invented_default_config() {
         "尚无生效配置 ⇒ idle（ADR-0004）"
     );
     assert_eq!(report.source, None);
-    assert!(
-        alerts.contains(&"workflow_config_refused".to_string()),
+    assert_eq!(
+        alert_count(&alerts, "workflow_config_refused"),
+        1,
         "idle 必须告警：{alerts:?}"
     );
     let counts = host.counts();
@@ -1148,8 +1214,9 @@ async fn a_fresh_config_orchestrates_normally_and_is_not_annotated() {
         "fresh 配置照常编排：{:?}",
         report.decisions
     );
-    assert!(
-        !alerts.contains(&"workflow_config_last_known_good".to_string()),
+    assert_eq!(
+        alert_count(&alerts, "workflow_config_last_known_good"),
+        0,
         "fresh 不做 LKG 标注：{alerts:?}"
     );
 }
@@ -1164,17 +1231,23 @@ async fn a_last_known_good_config_orchestrates_normally_and_is_annotated_every_t
     )
     .await;
 
-    let (report, alerts) = tick_with_alerts(&host, "2026-01-01T00:00:00Z").await;
+    // 两个 tick：LKG 标注是「本 tick 在用什么配置」，**每 tick 一条**——它不随 ticket #6 的
+    // 去重一起被消掉（那条只管世界事实类告警）。
+    let (reports, alerts) =
+        ticks_with_alerts(&host, "2026-01-01T00:00:00Z", 2, DedupScope::Shared, |_| {}).await;
 
-    assert!(
-        matches!(report.decisions.as_slice(), [Decision::Claim { .. }]),
-        "LKG 照常编排（不是 idle）：{:?}",
-        report.decisions
-    );
-    assert_eq!(report.source, Some(EffectiveSource::LastKnownGood));
-    assert!(
-        alerts.contains(&"workflow_config_last_known_good".to_string()),
-        "LKG 必须持续标注：{alerts:?}"
+    for report in &reports {
+        assert!(
+            matches!(report.decisions.as_slice(), [Decision::Claim { .. }]),
+            "LKG 照常编排（不是 idle）：{:?}",
+            report.decisions
+        );
+        assert_eq!(report.source, Some(EffectiveSource::LastKnownGood));
+    }
+    assert_eq!(
+        alert_count(&alerts, "workflow_config_last_known_good"),
+        reports.len(),
+        "LKG 必须持续标注：每 tick 一条，{alerts:?}"
     );
     assert_eq!(
         host.counts()
@@ -1183,9 +1256,210 @@ async fn a_last_known_good_config_orchestrates_normally_and_is_annotated_every_t
                 contract_path(ServiceName::Tracker, "/claims")
             ))
             .copied(),
-        Some(1),
-        "标注不妨碍编排：claim 照发"
+        Some(2),
+        "标注不妨碍编排：两个 tick 都 claim 了"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (e) 告警去重（ticket #6）
+// ---------------------------------------------------------------------------
+
+/// 一个 `blocked_by` 成环的视图：`chain` 里的票头尾相接成环（`A→B→C→A` 传 `["A","B","C"]`）。
+///
+/// 环上的票永远算不出 frontier，所以两个 tick 的决策表都是空的——断言的是告警条数，不是编排。
+fn cycle(chain: &[&str]) -> IssueListResponse {
+    let mut issues: Vec<IssueView> = chain
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let blocker = chain[(index + 1) % chain.len()];
+            let mut view = issue(None, IssueState::Open);
+            view.issue_id = (*id).to_string();
+            view.blocked_by = vec![blocker.to_string()];
+            view
+        })
+        .collect();
+    // 环外一张票：只依赖环上的票，自己不在环上——点名时不该带上它。
+    let mut outsider = issue(None, IssueState::Open);
+    outsider.issue_id = "S".to_string();
+    outsider.blocked_by = vec![chain[0].to_string()];
+    issues.push(outsider);
+    IssueListResponse { issues }
+}
+
+/// 两个 tick 过同一个环依赖世界：cycle 告警只出现一次（ticket #6 验收第 1 条）。
+#[tokio::test(flavor = "current_thread")]
+async fn the_same_cycle_is_alerted_once_across_ticks() {
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        cycle(&["A", "B", "C"]),
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+
+    let (reports, alerts) =
+        ticks_with_alerts(&host, "2026-01-01T00:00:00Z", 2, DedupScope::Shared, |_| {}).await;
+
+    assert_eq!(
+        alert_tickets(&alerts, "blocked_by_cycle"),
+        vec!["A,B,C"],
+        "同一个环两个 tick 只说一次：{alerts:?}"
+    );
+    assert_eq!(
+        reports.len(),
+        2,
+        "两个 tick 都真的跑了（防空洞：告警少可能是因为 tick 少）"
+    );
+    assert!(
+        reports.iter().all(|report| report.decisions.is_empty()),
+        "环上的票永远不 dispatchable：{:?}",
+        reports.iter().map(|r| &r.decisions).collect::<Vec<_>>()
+    );
+    let issues_route = format!("GET {}", contract_path(ServiceName::Tracker, "/issues"));
+    assert_eq!(
+        host.counts().get(&issues_route).copied(),
+        Some(2),
+        "两个 tick 各自读了一次视图：{}",
+        host.request_log().join("\n")
+    );
+}
+
+/// 对照组：每个 tick 一本新的去重账 ⇒ 同一条告警每个 tick 都发（证明上面那条是去重账的功劳，
+/// 不是世界没变 / 视图被缓存了）。
+#[tokio::test(flavor = "current_thread")]
+async fn a_fresh_dedup_each_tick_warns_every_time() {
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        cycle(&["A", "B", "C"]),
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+
+    let (_reports, alerts) = ticks_with_alerts(
+        &host,
+        "2026-01-01T00:00:00Z",
+        2,
+        DedupScope::PerTick,
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(
+        alert_tickets(&alerts, "blocked_by_cycle"),
+        vec!["A,B,C", "A,B,C"],
+        "去重位一换，环就每个 tick 都喊：{alerts:?}"
+    );
+}
+
+/// 环上的票换了**另一组**，就是另一条告警：去重键带票组，不是「这条 alert 一辈子只说一次」。
+#[tokio::test(flavor = "current_thread")]
+async fn a_different_cycle_is_a_different_alert() {
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        cycle(&["A", "B", "C"]),
+        empty_history(),
+        Vec::new(),
+    )
+    .await;
+
+    // 第二个 tick 之前把视图换成另一个环（D↔E）；第三个 tick 世界没变。
+    let (_reports, alerts) = ticks_with_alerts(
+        &host,
+        "2026-01-01T00:00:00Z",
+        3,
+        DedupScope::Shared,
+        |tick| {
+            if tick == 2 {
+                host.set(
+                    "GET",
+                    &contract_path(ServiceName::Tracker, "/issues"),
+                    &cycle(&["D", "E"]),
+                );
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(
+        alert_tickets(&alerts, "blocked_by_cycle"),
+        vec!["A,B,C", "D,E"],
+        "新的一组票是新的一条告警，第三个 tick 不再重复：{alerts:?}"
+    );
+    assert_eq!(
+        host.counts()
+            .get(&format!(
+                "GET {}",
+                contract_path(ServiceName::Tracker, "/issues")
+            ))
+            .copied(),
+        Some(3),
+        "三个 tick 都真的跑了（换世界的那一步才算数）：{}",
+        host.request_log().join("\n")
+    );
+}
+
+/// 保留窗口截断同样只告警一次（ticket #6 验收第 1 条的另一半）。
+#[tokio::test(flavor = "current_thread")]
+async fn a_truncated_window_is_alerted_once_across_ticks() {
+    let host = ready_host(
+        config(Some(workflow()), Some(EffectiveSource::Fresh)),
+        issues(Some(ASSIGNEE), IssueState::Claimed),
+        EventHistoryResponse {
+            events: Vec::new(),
+            truncated: true,
+        },
+        Vec::new(),
+    )
+    .await;
+
+    let (reports, alerts) =
+        ticks_with_alerts(&host, "2026-01-01T00:00:00Z", 2, DedupScope::Shared, |_| {}).await;
+
+    assert_eq!(
+        alert_count(&alerts, "history_truncated"),
+        1,
+        "宿主忙时每页都截断，但只喊一次：{alerts:?}"
+    );
+    assert_eq!(reports.len(), 2, "两个 tick 都真的跑了（防空洞）");
+    let history_route = format!("GET {}", contract_path(ServiceName::Events, "/history"));
+    assert_eq!(
+        host.counts().get(&history_route).copied(),
+        Some(2),
+        "两个 tick 各自拉了一次增量事件：{}",
+        host.request_log().join("\n")
+    );
+}
+
+#[test]
+fn the_dedup_key_is_the_alert_plus_its_ticket_group() {
+    let mut alerts = AlertDedup::default();
+    assert!(alerts.is_empty());
+
+    assert!(
+        alerts.first_sighting("blocked_by_cycle", "A,B"),
+        "第一次露面"
+    );
+    assert!(
+        !alerts.first_sighting("blocked_by_cycle", "A,B"),
+        "同一条不再发"
+    );
+    assert!(
+        alerts.first_sighting("blocked_by_cycle", "A,B,C"),
+        "另一组票是另一条告警"
+    );
+    assert!(
+        alerts.first_sighting("blocked_by_cycle", ""),
+        "空票组与有票组不是同一条键"
+    );
+    assert!(
+        alerts.first_sighting("history_truncated", ""),
+        "另一条 alert"
+    );
+    assert_eq!(alerts.len(), 4);
+    assert!(!alerts.is_empty());
 }
 
 #[tokio::test]
@@ -1223,6 +1497,7 @@ async fn a_hard_failure_cuts_the_tick_short_so_no_further_sequence_is_issued() {
         &config,
         &ledger,
         &mut world,
+        &mut AlertDedup::default(),
         "2026-01-01T00:00:00Z",
         1,
     )
@@ -1274,6 +1549,7 @@ async fn a_tick_without_a_hard_failure_is_not_cut_short() {
         &config,
         &ledger,
         &mut world,
+        &mut AlertDedup::default(),
         "2026-01-01T00:00:00Z",
         1,
     )

@@ -153,21 +153,59 @@ pub struct TestHost {
     _dir: tempfile::TempDir,
 }
 
+/// 播种的一张原生票（`FARM_NATIVE_TICKETS` 的形状：号 + 标签 + 堵住它的票号）。
+///
+/// `blocked_by` 也要能演：环依赖演练（ticket #6）靠它造「谁都不 dispatchable」的世界。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TicketSeed {
+    /// 原生票号（归一化后它就是票 id：native provider 用裸号）。
+    pub number: u32,
+    /// 堵住本票的票号（provider 侧的方向：本票被这些票堵住）。
+    pub blocked_by: Vec<u32>,
+}
+
+impl TicketSeed {
+    /// 一张没人堵的票。
+    pub fn open(number: u32) -> Self {
+        Self {
+            number,
+            blocked_by: Vec::new(),
+        }
+    }
+}
+
 impl TestHost {
-    /// spawn 宿主：临时回环端口、tempdir 里的库、播种若干 open 原生票（`dispatch` 标签），
-    /// **带** admin token（读生效配置要它：`60-environment-and-risks.md` R6）。
+    /// spawn 宿主：临时回环端口、tempdir 里的库、按播种清单播若干 open 原生票
+    /// （`dispatch` 标签），**带** admin token（读生效配置要它：`60-environment-and-risks.md` R6）。
     pub async fn spawn(ticket_numbers: &[u32], extra_env: &[(&str, String)]) -> Self {
+        let seeded: Vec<TicketSeed> = ticket_numbers
+            .iter()
+            .copied()
+            .map(TicketSeed::open)
+            .collect();
+        Self::spawn_seeded(&seeded, extra_env).await
+    }
+
+    /// 同 [`TestHost::spawn`]，但播种清单带 `blocked_by`（环依赖演练用）。
+    pub async fn spawn_seeded(seeded: &[TicketSeed], extra_env: &[(&str, String)]) -> Self {
         let bin = host_bin().expect("farm-host 二进制（调用方先查过存在性）");
         let dir = tempfile::tempdir().expect("tempdir");
         let addr = ephemeral_port();
         let op_token = "e2e-op-token".to_string();
         let admin_token = "e2e-admin-token".to_string();
 
-        let tickets: Vec<String> = ticket_numbers
+        let tickets: Vec<String> = seeded
             .iter()
-            .map(|number| {
+            .map(|seed| {
+                let blocked_by = seed
+                    .blocked_by
+                    .iter()
+                    .map(|number| number.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 format!(
-                    r#"{{"number":{number},"title":"ticket {number}","state":"open","labels":["{SEED_LABEL}"],"blocked_by":[]}}"#
+                    r#"{{"number":{},"title":"ticket {}","state":"open","labels":["{}"],"blocked_by":[{}]}}"#,
+                    seed.number, seed.number, SEED_LABEL, blocked_by
                 )
             })
             .collect();
